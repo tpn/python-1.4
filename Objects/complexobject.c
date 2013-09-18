@@ -6,6 +6,7 @@
 
 #include "allobjects.h"
 #include "modsupport.h"
+#include "threadstate.h"
 
 #include <errno.h>
 #include "mymath.h"
@@ -55,7 +56,6 @@ extern double pow PROTO((double, double));
 
 /* elementary operations on complex numbers */
 
-static int c_error;
 static Py_complex c_1 = {1., 0.};
 
 Py_complex c_sum(a,b)
@@ -100,7 +100,10 @@ Py_complex c_quot(a,b)
 	Py_complex r;
 	double d = b.real*b.real + b.imag*b.imag;
 	if (d == 0.)
-		c_error = 1;
+	{
+		PyThreadState *pts = PyThreadState_Get();
+		pts->c_error = 1;
+	}
 	r.real = (a.real*b.real + a.imag*b.imag)/d;
 	r.imag = (a.imag*b.real - a.real*b.imag)/d;
 	return r;
@@ -117,7 +120,10 @@ Py_complex c_pow(a,b)
 	}
 	else if (a.real == 0. && a.imag == 0.) {
 		if (b.imag != 0. || b.real < 0.)
-			c_error = 2;
+		{
+			PyThreadState *pts = PyThreadState_Get();
+			pts->c_error = 2;
+		}
 		r.real = 0.;
 		r.imag = 0.;
 	}
@@ -361,9 +367,11 @@ complex_div(v, w)
 	complexobject *w;
 {
 	Py_complex quot;
-	c_error = 0;
+	PyThreadState *pts = PyThreadState_Get();
+
+	pts->c_error = 0;
 	quot = c_quot(v->cval,w->cval);
-	if (c_error == 1) {
+	if (pts->c_error == 1) {
 		err_setstr(ZeroDivisionError, "complex division");
 		return NULL;
 	}
@@ -376,9 +384,11 @@ complex_remainder(v, w)
 	complexobject *w;
 {
         Py_complex div, mod;
-	c_error = 0;
+	PyThreadState *pts = PyThreadState_Get();
+
+	pts->c_error = 0;
 	div = c_quot(v->cval,w->cval); /* The raw divisor value. */
-	if (c_error == 1) {
+	if (pts->c_error == 1) {
 		err_setstr(ZeroDivisionError, "complex remainder");
 		return NULL;
 	}
@@ -397,9 +407,11 @@ complex_divmod(v, w)
 {
         Py_complex div, mod;
 	PyObject *d, *m, *z;
-	c_error = 0;
+	PyThreadState *pts = PyThreadState_Get();
+
+	pts->c_error = 0;
 	div = c_quot(v->cval,w->cval); /* The raw divisor value. */
-	if (c_error == 1) {
+	if (pts->c_error == 1) {
 		err_setstr(ZeroDivisionError, "complex divmod()");
 		return NULL;
 	}
@@ -423,13 +435,15 @@ complex_pow(v, w, z)
 	Py_complex p;
 	Py_complex exponent;
 	long int_exponent;
+	PyThreadState *pts = PyThreadState_Get();
+
 
  	if ((object *)z!=None) {
 		err_setstr(ValueError, "complex modulo");
 		return NULL;
 	}
 
-	c_error = 0;
+	pts->c_error = 0;
 	exponent = ((complexobject*)w)->cval;
 	int_exponent = (long)exponent.real;
 	if (exponent.imag == 0. && exponent.real == int_exponent)
@@ -437,7 +451,7 @@ complex_pow(v, w, z)
 	else
 		p = c_pow(v->cval,exponent);
 
-	if (c_error == 2) {
+	if (pts->c_error == 2) {
 		err_setstr(ValueError, "0.0 to a negative or complex power");
 		return NULL;
 	}

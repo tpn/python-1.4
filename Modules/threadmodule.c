@@ -40,8 +40,9 @@ Rerun configure, adding a --with-thread option.
 #endif
 
 #include "thread.h"
+#include "threadstate.h"
 
-extern int threads_started;
+extern volatile int threads_started;
 
 static object *ThreadError;
 
@@ -199,7 +200,9 @@ t_bootstrap(args_raw)
 	object *args = (object *) args_raw;
 	object *func, *arg, *res;
 
-	threads_started++;
+	/* this doesn't need a CRIT section; we just want non-zero */
+	threads_started = 1;
+	PyThreadState_New();
 
 	restore_thread((void *)NULL);
 	func = gettupleitem(args, 0);
@@ -217,6 +220,7 @@ t_bootstrap(args_raw)
 	else
 		DECREF(res);
 	(void) save_thread(); /* Should always be NULL */
+	PyThreadState_Free();
 	exit_thread();
 }
 

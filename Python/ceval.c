@@ -45,6 +45,8 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "eval.h"
 #include "opcode.h"
 #include "graminit.h"
+#include "threadstate.h"
+#include "pymutex.h"
 
 #include <ctype.h>
 
@@ -108,26 +110,28 @@ static int exec_statement PROTO((object *, object *, object *));
 static object *find_from_args PROTO((frameobject *, int));
 
 
-/* Pointer to current frame, used to link new frames to */
-
-static frameobject *current_frame;
-
 #ifdef WITH_THREAD
 
 #include <errno.h>
 #include "thread.h"
 
+#ifndef WITH_FREE_THREAD
+#define USE_INTERPRETER_LOCK
 static type_lock interpreter_lock = 0;
+#endif
+
 static long main_thread = 0;
 
 void
 init_save_thread()
 {
-	if (interpreter_lock)
+	if (main_thread)
 		return;
+	main_thread = get_thread_ident();
+#ifdef USE_INTERPRETER_LOCK
 	interpreter_lock = allocate_lock();
 	acquire_lock(interpreter_lock, 1);
-	main_thread = get_thread_ident();
+#endif
 }
 
 #endif
@@ -139,13 +143,9 @@ init_save_thread()
 object *
 save_thread()
 {
-#ifdef WITH_THREAD
+#ifdef USE_INTERPRETER_LOCK
 	if (interpreter_lock) {
-		object *res;
-		res = (object *)current_frame;
-		current_frame = NULL;
 		release_lock(interpreter_lock);
-		return res;
 	}
 #endif
 	return NULL;
@@ -155,13 +155,12 @@ void
 restore_thread(x)
 	object *x;
 {
-#ifdef WITH_THREAD
+#ifdef USE_INTERPRETER_LOCK
 	if (interpreter_lock) {
 		int err;
 		err = errno;
 		acquire_lock(interpreter_lock, 1);
 		errno = err;
-		current_frame = (frameobject *)x;
 	}
 #endif
 }
@@ -181,10 +180,8 @@ restore_thread(x)
    Note that because registry may occur from within signal handlers,
    or other asynchronous events, calling malloc() is unsafe!
 
-#ifdef WITH_THREAD
    Any thread can schedule pending calls, but only the main thread
    will execute them.
-#endif
 
    XXX WARNING!  ASYNCHRONOUSLY EXECUTING CODE!
    There are two possible race conditions:
@@ -194,9 +191,9 @@ restore_thread(x)
    The current code is safe against (2), but not against (1).
    The safety against (2) is derived from the fact that only one
    thread (the main thread) ever takes things out of the queue.
-*/
 
-static int ticker = 0; /* main loop counter to do periodic things */
+   Both conditions are safe when WITH_FREE_THREAD is enabled.
+*/
 
 #define NPENDINGCALLS 32
 static struct {
@@ -211,42 +208,65 @@ Py_AddPendingCall(func, arg)
 	int (*func) PROTO((ANY *));
 	ANY *arg;
 {
-	static int busy = 0;
 	int i, j;
+	int result = -1;
+	PyThreadState *pts = PyThreadState_Get();
+
+#ifdef WITH_FREE_THREAD
+	Py_CRIT_LOCK();
+#else
+	static int busy = 0;
 	/* XXX Begin critical section */
 	/* XXX If you want this to be safe against nested
 	   XXX asynchronous calls, you'll have to work harder! */
 	if (busy)
 		return -1;
 	busy = 1;
+#endif
+
 	i = pendinglast;
 	j = (i + 1) % NPENDINGCALLS;
-	if (j == pendingfirst)
-		return -1; /* Queue full */
-	pendingcalls[i].func = func;
-	pendingcalls[i].arg = arg;
-	pendinglast = j;
-	ticker = 0; /* Signal main loop */
+	if (j != pendingfirst) {
+		/* Queue has room */
+		pendingcalls[i].func = func;
+		pendingcalls[i].arg = arg;
+		pendinglast = j;
+		result = 0;
+	}
+	pts->interp_ticker = 0; /* Signal main loop */
+
+#ifdef WITH_FREE_THREAD
+	Py_CRIT_UNLOCK();
+#else
 	busy = 0;
 	/* XXX End critical section */
-	return 0;
+#endif
+
+	return result;
 }
 
 int
 Py_MakePendingCalls()
 {
+	PyThreadState *pts = PyThreadState_Get();
+	int result = 0;
 	static int busy = 0;
+
 #ifdef WITH_THREAD
 	if (get_thread_ident() != main_thread) {
-		ticker = 0; /* We're not done yet */
+		pts->interp_ticker = 0; /* We're not done yet */
 		return 0;
 	}
 #endif
+
+	/* no fancy locking needed: only one thread will enter */
 	if (busy) {
-		ticker = 0; /* We're not done yet */
+		pts->interp_ticker = 0; /* We're not done yet */
 		return 0;
 	}
+
 	busy = 1;
+
 	for (;;) {
 		int i;
 		int (*func) PROTO((ANY *));
@@ -258,13 +278,15 @@ Py_MakePendingCalls()
 		arg = pendingcalls[i].arg;
 		pendingfirst = (i + 1) % NPENDINGCALLS;
 		if (func(arg) < 0) {
-			busy = 0;
-			ticker = 0; /* We're not done yet */
-			return -1;
+			pts->interp_ticker = 0; /* We're not done yet */
+			result = -1;
+			break;
 		}
 	}
+
 	busy = 0;
-	return 0;
+
+	return result;
 }
 
 
@@ -302,8 +324,6 @@ eval_code(co, globals, locals)
 #define MAX_RECURSION_DEPTH 10000
 #endif
 
-static int recursion_depth = 0;
-
 static object *
 eval_code2(co, globals, locals,
 	   args, argcount, kws, kwcount, defs, defcount, owner)
@@ -332,6 +352,7 @@ eval_code2(co, globals, locals,
 	register frameobject *f; /* Current frame */
 	register object **fastlocals;
 	object *retval;		/* Return value */
+	PyThreadState *pts;
 #ifdef SUPPORT_OBSOLETE_ACCESS
 	int defmode = 0;	/* Default access mode for new variables */
 #endif
@@ -380,8 +401,10 @@ eval_code2(co, globals, locals,
 #define SETLOCAL(i, value)	do { XDECREF(GETLOCAL(i)); \
 				     GETLOCAL(i) = value; } while (0)
 
+	pts = PyThreadState_Get();
+
 #ifdef USE_STACKCHECK
-	if (recursion_depth%10 == 0 && PyOS_CheckStack()) {
+	if (pts->recursion_depth%10 == 0 && PyOS_CheckStack()) {
 		err_setstr(MemoryError, "Stack overflow");
 		return NULL;
 	}
@@ -397,7 +420,7 @@ eval_code2(co, globals, locals,
 #endif
 
 	f = newframeobject(
-			current_frame,		/*back*/
+			pts->current_frame,	/*back*/
 			co,			/*code*/
 			globals,		/*globals*/
 			locals,			/*locals*/
@@ -407,7 +430,7 @@ eval_code2(co, globals, locals,
 	if (f == NULL)
 		return NULL;
 
-	current_frame = f;
+	pts->current_frame = f;
 
 	if (co->co_nlocals > 0)
 		fastlocals = ((listobject *)f->f_fastlocals)->ob_item;
@@ -507,14 +530,14 @@ eval_code2(co, globals, locals,
 		if (argcount > 0 || kwcount > 0) {
 			err_setstr(TypeError, "no arguments expected");
  fail2:
-			current_frame = f->f_back;
+			pts->current_frame = f->f_back;
 			DECREF(f);
 			return NULL;
 		}
 	}
 
-	if (sys_trace != NULL) {
-		/* sys_trace, if defined, is a function that will
+	if (pts->sys_tracefunc != NULL) {
+		/* sys_tracefunc, if defined, is a function that will
 		   be called  on *every* entry to a code block.
 		   Its return value, if not None, is a function that
 		   will be called at the start of each executed line
@@ -526,30 +549,30 @@ eval_code2(co, globals, locals,
 		   depends on the situation.  The global trace function
 		   (sys.trace) is also called whenever an exception
 		   is detected. */
-		if (call_trace(&sys_trace, &f->f_trace, f, "call",
+		if (call_trace(&pts->sys_tracefunc, &f->f_trace, f, "call",
 			       None/*XXX how to compute arguments now?*/)) {
 			/* Trace function raised an error */
-			current_frame = f->f_back;
+			pts->current_frame = f->f_back;
 			DECREF(f);
 			return NULL;
 		}
 	}
 
-	if (sys_profile != NULL) {
-		/* Similar for sys_profile, except it needn't return
+	if (pts->sys_profilefunc != NULL) {
+		/* Similar for sys_profilefunc, except it needn't return
 		   itself and isn't called for "line" events */
-		if (call_trace(&sys_profile, (object**)0, f, "call",
+		if (call_trace(&pts->sys_profilefunc, (object**)0, f, "call",
 			       None/*XXX*/)) {
-			current_frame = f->f_back;
+			pts->current_frame = f->f_back;
 			DECREF(f);
 			return NULL;
 		}
 	}
 
-	if (++recursion_depth > MAX_RECURSION_DEPTH) {
-		--recursion_depth;
+	if (++pts->recursion_depth > MAX_RECURSION_DEPTH) {
+		--pts->recursion_depth;
 		err_setstr(RuntimeError, "Maximum recursion depth exceeded");
-		current_frame = f->f_back;
+		pts->current_frame = f->f_back;
 		DECREF(f);
 		return NULL;
 	}
@@ -571,8 +594,8 @@ eval_code2(co, globals, locals,
 		   calls (see Py_AddPendingCalls() and
 		   Py_MakePendingCalls() above). */
 		
-		if (--ticker < 0) {
-			ticker = sys_checkinterval;
+		if (--pts->interp_ticker < 0) {
+			pts->interp_ticker = pts->sys_checkinterval;
 			if (pendingfirst != pendinglast) {
 				if (Py_MakePendingCalls() < 0) {
 					why = WHY_EXCEPTION;
@@ -584,17 +607,15 @@ eval_code2(co, globals, locals,
 				goto on_error;
 			}
 
-#ifdef WITH_THREAD
+#ifdef USE_INTERPRETER_LOCK
 			if (interpreter_lock) {
 				/* Give another thread a chance */
 
-				current_frame = NULL;
 				release_lock(interpreter_lock);
 
 				/* Other threads may run now */
 
 				acquire_lock(interpreter_lock, 1);
-				current_frame = f;
 			}
 #endif
 		}
@@ -1770,8 +1791,8 @@ eval_code2(co, globals, locals,
 
 			if (f->f_trace)
 				call_exc_trace(&f->f_trace, &f->f_trace, f);
-			if (sys_profile)
-				call_exc_trace(&sys_profile, (object**)0, f);
+			if (pts->sys_profilefunc)
+				call_exc_trace(&pts->sys_profilefunc, (object**)0, f);
 		}
 		
 		/* For the rest, treat WHY_RERAISE as WHY_EXCEPTION */
@@ -1856,8 +1877,8 @@ eval_code2(co, globals, locals,
 		}
 	}
 	
-	if (sys_profile && why == WHY_RETURN) {
-		if (call_trace(&sys_profile, (object**)0,
+	if (pts->sys_profilefunc && why == WHY_RETURN) {
+		if (call_trace(&pts->sys_profilefunc, (object**)0,
 			       f, "return", retval)) {
 			XDECREF(retval);
 			retval = NULL;
@@ -1867,9 +1888,9 @@ eval_code2(co, globals, locals,
 	
 	/* Restore previous frame and release the current one */
 
-	current_frame = f->f_back;
+	pts->current_frame = f->f_back;
 	DECREF(f);
-	--recursion_depth;
+	--pts->recursion_depth;
 	
 	return retval;
 }
@@ -1928,9 +1949,9 @@ call_trace(p_trace, p_newtrace, f, msg, arg)
 {
 	object *args, *what;
 	object *res = NULL;
-	static int tracing = 0;
+	PyThreadState *pts = PyThreadState_Get();
 	
-	if (tracing) {
+	if (pts->tracing) {
 		/* Don't do recursive traces */
 		if (p_newtrace) {
 			XDECREF(*p_newtrace);
@@ -1952,11 +1973,11 @@ call_trace(p_trace, p_newtrace, f, msg, arg)
 		arg = None;
 	INCREF(arg);
 	SETTUPLEITEM(args, 2, arg);
-	tracing++;
+	pts->tracing++;
 	fast_2_locals(f);
 	res = call_object(*p_trace, args); /* May clear *p_trace! */
 	locals_2_fast(f, 1);
-	tracing--;
+	pts->tracing--;
  cleanup:
 	XDECREF(args);
 	if (res == NULL) {
@@ -1988,49 +2009,55 @@ call_trace(p_trace, p_newtrace, f, msg, arg)
 object *
 getbuiltins()
 {
-	if (current_frame == NULL)
+	PyThreadState *pts = PyThreadState_Get();
+	if (pts->current_frame == NULL)
 		return getbuiltinmod();
 	else
-		return current_frame->f_builtins;
+		return pts->current_frame->f_builtins;
 }
 
 object *
 getlocals()
 {
-	if (current_frame == NULL)
+	PyThreadState *pts = PyThreadState_Get();
+	if (pts->current_frame == NULL)
 		return NULL;
-	fast_2_locals(current_frame);
-	return current_frame->f_locals;
+	fast_2_locals(pts->current_frame);
+	return pts->current_frame->f_locals;
 }
 
 object *
 getglobals()
 {
-	if (current_frame == NULL)
+	PyThreadState *pts = PyThreadState_Get();
+	if (pts->current_frame == NULL)
 		return NULL;
 	else
-		return current_frame->f_globals;
+		return pts->current_frame->f_globals;
 }
 
 object *
 getowner()
 {
-	if (current_frame == NULL)
+	PyThreadState *pts = PyThreadState_Get();
+	if (pts->current_frame == NULL)
 		return NULL;
 	else
-		return current_frame->f_owner;
+		return pts->current_frame->f_owner;
 }
 
 object *
 getframe()
 {
-	return (object *)current_frame;
+	PyThreadState *pts = PyThreadState_Get();
+	return (object *)pts->current_frame;
 }
 
 int
 getrestricted()
 {
-	return current_frame == NULL ? 0 : current_frame->f_restricted;
+	PyThreadState *pts = PyThreadState_Get();
+	return pts->current_frame == NULL ? 0 : pts->current_frame->f_restricted;
 }
 
 void
@@ -2963,6 +2990,7 @@ exec_statement(prog, globals, locals)
 	object *globals;
 	object *locals;
 {
+	PyThreadState *pts = PyThreadState_Get();
 	char *s;
 	int n;
 	object *v;
@@ -2998,7 +3026,7 @@ exec_statement(prog, globals, locals)
 		return -1;
 	}
 	if (dictlookup(globals, "__builtins__") == NULL)
-		dictinsert(globals, "__builtins__", current_frame->f_builtins);
+		dictinsert(globals, "__builtins__", pts->current_frame->f_builtins);
 	if (is_codeobject(prog)) {
 		if (eval_code((codeobject *) prog, globals, locals) == NULL)
 			return -1;
@@ -3021,7 +3049,7 @@ exec_statement(prog, globals, locals)
 		return -1;
 	DECREF(v);
 	if (plain)
-		locals_2_fast(current_frame, 0);
+		locals_2_fast(pts->current_frame, 0);
 	return 0;
 }
 

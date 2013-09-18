@@ -33,6 +33,7 @@ PERFORMANCE OF THIS SOFTWARE.
 
 #include "Python.h"
 #include "intrcheck.h"
+#include "pymutex.h"
 
 #include <signal.h>
 
@@ -82,8 +83,8 @@ struct PySignal_SignalArrayStruct {
 	PyObject *func;
 };
 
-static struct PySignal_SignalArrayStruct PySignal_SignalHandlerArray[NSIG];
-static int PySignal_IsTripped = 0; /* Speed up sigcheck() when none tripped */
+static volatile struct PySignal_SignalArrayStruct PySignal_SignalHandlerArray[NSIG];
+static volatile int PySignal_IsTripped = 0; /* Speed up sigcheck() when none tripped */
 
 static PyObject *PySignal_SignalDefaultHandler;
 static PyObject *PySignal_SignalIgnoreHandler;
@@ -101,6 +102,8 @@ PySignal_CDefaultIntHandler(self, arg)
 void
 PyErr_SetInterrupt()
 {
+	/* note: we don't have to use Py_CRIT_LOCK here. we just want IsTripped
+	   to be non-zero, not exact. */
 	PySignal_IsTripped++;
 	PySignal_SignalHandlerArray[SIGINT].tripped = 1;
 }
@@ -199,10 +202,15 @@ PySignal_Signal(self, args)
 		PyErr_SetFromErrno(PyExc_RuntimeError);
 		return (PyObject *)NULL;
 	}
+
+	/* lock until we get the refcounts right (sync with GetSignal) */
+	Py_CRIT_LOCK();
 	old_handler = PySignal_SignalHandlerArray[sig_num].func;
 	PySignal_SignalHandlerArray[sig_num].tripped = 0;
 	Py_INCREF(obj);
 	PySignal_SignalHandlerArray[sig_num].func = obj;
+	Py_CRIT_UNLOCK();
+
 	return old_handler;
 }
 
@@ -220,8 +228,13 @@ PySignal_GetSignal(self, args)
 				"signal number out of range");
 		return (PyObject *)NULL;
 	}
+
+	/* lock until we get the refcounts right (sync with main thread) */
+	Py_CRIT_LOCK();
 	old_handler = PySignal_SignalHandlerArray[sig_num].func;
 	Py_INCREF(old_handler);
+	Py_CRIT_UNLOCK();
+
 	return old_handler;
 }
 
@@ -451,6 +464,9 @@ PyErr_CheckSignals()
 	if (get_thread_ident() != main_thread)
 		return 0;
 #endif
+	/* clear now; it may get tripped again while we're processing */
+	PySignal_IsTripped = 0;
+
 	f = PyEval_GetFrame();
 	if (f == (PyObject *)NULL)
 		f = Py_None;
@@ -462,6 +478,9 @@ PyErr_CheckSignals()
 			if (arglist == (PyObject *)NULL)
 				result = (PyObject *)NULL;
 			else {
+				/* note: we're in the main thread, so the
+				   func is stable (can only change in the
+				   main thread) */
 				result = PyEval_CallObject(
 				 PySignal_SignalHandlerArray[i].func, arglist);
 				Py_DECREF(arglist);
@@ -473,7 +492,6 @@ PyErr_CheckSignals()
 			}
 		}
 	}
-	PySignal_IsTripped = 0;
 	return 0;
 }
 

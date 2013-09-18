@@ -1,0 +1,244 @@
+"FREE THREADING" PATCHES		Greg Stein <gstein@svpal.org>
+
+Updated: January 31, 1996 (see HISTORY below)
+
+
+-----------------------------------------------------------------------
+
+These patches enable Python to be "free threaded" or, in other words,
+fully reentrant across multiple threads.  This is particularly important
+when Python is embedded within a C program.  The big win here is that
+these patches remove the global interpreter lock, enabling multiple
+threads to simultaneously run without the bottleneck at the interpreter.
+Applications and servers written entirely in Python can also benefit
+from this if they spawn many threads that have few contention points.
+
+A side benefit of these patches is simpler handling of threading in
+extension modules: Py_BEGIN_ALLOW_THREAD/Py_END_ALLOW_THREAD are not
+needed, since the executing thread can block without affecting the
+operation of other threads within the interpreter.  In fact, those
+macros essentially perform noops when free threading is enabled.
+Extension modules that are not reentrant can create and manage a mutex
+for itself via the pymutex.h functions.
+
+
+CURRENT CAVEATS
+
+* These patches are currently for use only by people who consider
+  themselves experts with Python, and in particular with some of the
+  internals of Python, coding C extensions, threading, and/or embedding
+  Python.  Until the patches have been extensively tested, a novice
+  could get into big trouble :-)
+
+* As a corollary to the above statement, I don't plan to handhold
+  people's installation and use of these patches.  At this point, I'm
+  looking for people who want to test them and provide feedback.  Any
+  feedback for implementation of mutexes on platforms besides Linux
+  and NT are also appreciated.  Integration of options into "configure"
+  and such are also welcome.  Lastly, comments and suggestions on
+  expanding this README would be very much appreciated.
+
+* There are many global variables in Python that are "write once, read
+  many."  The initial writing of these variables have no write-locks.
+  It is possible that a race condition can occur between two threads
+  and both will try to store a value into the global; one will be lost
+  and a subsequent memory leak will occur.  This is a one-time hit
+  rather than a continuous leak.
+
+* Python's standard, supplied modules (both .py and .c type modules)
+  have not been inspected for threading needs.  Use of unverified
+  modules in a threaded application is subject to failure.  .py files
+  shouldn't crash Python; they'll just be subject to standard race
+  condition errors.  It is quite possible, however, that a .c
+  extension module is not thread-safe.
+
+* The code has not been extensively tested.  Specifically, only initial
+  testing has been performed on a Linux and an NT system.  Other
+  platforms will need to add their own mutex support into pymutex.h.
+
+* Integration with the "configure" script has not been performed.
+  Specifically, you must hand-enter #define WITH_FREE_THREAD into your
+  config.h and completely recompile Python itself plus any modules or
+  code that compile against the Python headers (things like Py_INCREF
+  change when WITH_FREE_THREAD is defined).
+  Note: the PC/config.h file has already been updated
+
+* The sys module's trace function, profile function, and "check
+  interval" are now per-thread.  The values for these will be
+  inherited from the current thread at thread-creation time and any
+  future changes will apply only to the current thread.  Further, the
+  variables _PySys_TraceFunc, _PySys_ProfileFunc, and
+  _PySys_CheckInterval are no longer available in Python's exposed
+  C interface. 
+
+* The exception information is also per-thread now.  An exception in
+  one thread will not affect other threads.
+
+  NOTE: the exception info is still copied into the "sys" module which
+        is not per-thread.
+
+  NOTE: This will be fixed in a future update by adding a function to
+        the sys module to return the current thread's exception info.
+
+* There are potential race conditions within the interpreter with
+  respect to the PyList_GetItem() and PyDict_GetItem() functions.
+  These do not INCREF their result, so it is possible for them to be
+  deallocated before the caller can get a chance to use them.
+
+  NOTE: This will be fixed in a future update by deprecating those
+        interfaces and adding PyXXX_FetchItem() interfaces that will
+	always INCREF their results.
+
+
+-----------------------------------------------------------------------
+
+BUILD NOTES
+
+Simply unpack the distribution over the top of your Python 1.4 source
+tree, edit config.h to add a WITH_FREE_THREAD define, and rebuild
+Python.  For Unix users, you should have configured python using
+--with-thread (Win32 includes threads by default, and the config.h is
+already adjusted).
+
+The threading patches are distributed as a .tar.gz rather than as a
+patch file for a couple reasons: patch isn't usually available on most
+Win32 systems and because six files have been added to Python.
+
+Bug fixes, change requests, suggestions, etc, can be sent to
+Greg Stein (mailto:gstein@svpal.org).
+
+
+-----------------------------------------------------------------------
+
+LINUX NOTES
+
+You will need the latest C libraries (5.3.12).  That library works
+correctly with pthreads.  Note that some binary distributions of libc
+don't come with a binary of libpthreads.so.  I had to build mine from
+scratch :-(.  Please don't ask how to build a new libc...
+
+Once you have the new libc properly installed on your system, then
+you'll need to configure python with threads (--with-thread to the
+"configure" program).  Then edit the config.h file and look for
+#define _POSIX_THREAD and add another line that is something like
+#define _MIT_POSIX_THREAD or whatever.  Look at /usr/include/pthread.h
+for the proper symbol.  Next, go to the define for WITH_THREAD and add
+a second line: #define WITH_FREE_THREAD.
+
+--
+
+Lately, I've been testing with libc 5.4.17 and LinuxThread 0.5.  It
+seems to work quite fine.  Some of the threading issues with system
+calls seem to work much better (as the kernal does it rather than in
+the user space as MIT pthreads do).
+
+
+-----------------------------------------------------------------------
+
+NT NOTES
+
+Within the patch distribution, there is a modified config.h that has
+WITH_FREE_THREAD defined (for MSVC 4.x compilations).  Rebuild your
+version of Python (and all associated .pyd/.dll files).
+
+
+-----------------------------------------------------------------------
+
+SOLARIS NOTES
+
+Hiren Hindoccha reported success with using these patches on Solaris
+2.5.1.  He followed the Linux notes, minus the bit about setting
+the _MIT_POSIX_THREAD flag.  Hiren used the SunPro Compiler 4, but has
+not yet tested them with gcc.
+
+
+-----------------------------------------------------------------------
+
+IMPLEMENTATION NOTES
+
+All per-thread data has been moved into a structure defined in
+threadstate.h.  A pointer to that structure is retrieved with code
+such as:
+
+  PyThreadState *pts = PyThreadState_Get();
+
+This will then point to the current thread's global data.  Since the
+data is private to the thread, locking is not needed when modifying
+its contents.
+
+Short-term locks on critical sections of code can use the
+Py_CRIT_LOCK() and Py_CRIT_UNLOCK() macros provided in pymutex.h.
+Note that these macros are *NOT* reentrant.  Make sure that while you
+have locked a critical section that you don't call another piece of
+code which might need them.  This includes calls to Py_DECREF which
+could cause a deallocation which could then lead to code that needs
+the CRIT lock.  Generally speaking, don't do any function calls while
+you hold the lock.
+
+NOTE: Guido will be folding in my per-thread state work into the next
+      release of Python.  The free-threading patches will reduce in
+      size, but will probably not be in the base distribution (as of
+      this writing).
+
+
+-----------------------------------------------------------------------
+
+USE WHEN EMBEDDING
+
+When Python is first initialized, it will create a "main thread" state
+structure associated with the thread that initialized the interpreter.
+The data that resides there then becomes default state, even if it is
+never used again (the interpreter is never called again by the thread
+that inited python).
+
+Note: "pending calls" as defined in ceval.c will only be run by the
+main thread, so ensure you don't use them in your embedded app or make
+sure the main thread runs every now and then.
+
+When you are calling into Python from your C program, structure the
+code like so:
+
+{
+    int created = PyThreadState_Ensure();
+
+    <call into Python>
+
+    if ( created )
+        PyThreadState_Free();
+}
+
+The PyThreadState_Ensure() ensures that a thread state structure exists
+for the current thread.  It will return a flag indicating whether a
+structure was created or not.  If one was created, then you should
+free it.  Typically, one will *not* be created if you hit the above
+code through re-entrance.  Regardless, the outermost caller who created
+the structure will see to it that the state is thrown out.
+
+Note: while it is a good idea to prevent memory leaks and toss out the
+thread state structures, the performance of the system will not be
+affected.  Unused thread state gets pushed towards the end of a linked
+list (more specifically, thread state that gets used is pulled to the
+front :-).
+
+Within your embedded program, and within the Ensure/Free block, feel
+free to use Py_INCREF(), Py_DECREF(), object allocators (such as
+PyString_FromString()), and calling into Python (with things like
+PyObject_CallMethod()) freely.  The only place where you need to
+beware is that sys.exc_xxx is shared across threads.
+
+
+-----------------------------------------------------------------------
+
+HISTORY
+
+October 13, 1996:
+    Initial release of the patches.
+
+December 31, 1996:
+    Updated with respect to the Python 1.4 final release.
+    Fixed a couple minor nits related to the NT part of the patches.
+
+January 31, 1996:
+    Major update.
+    Added thread safety to lists and dictionaries.
+    Fixed potential deallocation race condition.

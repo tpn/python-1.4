@@ -41,9 +41,9 @@ OBJS=		\
 		getplatform.o getversion.o graminit.o \
 		import.o importdl.o \
 		marshal.o modsupport.o mystrtoul.o \
-		pythonrun.o \
+		pymutex.o pypooledlock.o pythonrun.o \
 		sigcheck.o structmember.o sysmodule.o \
-		traceback.o \
+		threadstate.o traceback.o \
 		$(LIBOBJS)
 
 LIB=		libPython.a
@@ -107,6 +107,8 @@ marshal.o: marshal.c
 memmove.o: memmove.c
 modsupport.o: modsupport.c
 mystrtoul.o: mystrtoul.c
+pymutex.o: pymutex.c
+pypooledlock.o: pypooledlock.c
 pythonrun.o: pythonrun.c
 sigcheck.o: sigcheck.c
 strerror.o: strerror.c
@@ -114,6 +116,7 @@ strtod.o: strtod.c
 structmember.o: structmember.c
 sysmodule.o: sysmodule.c
 thread.o: thread.c
+threadstate.o: threadstate.c
 traceback.o: traceback.c
 version.o: version.c
 

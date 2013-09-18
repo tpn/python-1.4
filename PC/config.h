@@ -78,6 +78,7 @@ typedef int pid_t;
 #define HAVE_STRFTIME
 #define NT_THREADS
 #define WITH_THREAD
+#define WITH_FREE_THREAD
 #ifndef NETSCAPE_PI
 #define USE_SOCKET
 #endif
@@ -151,6 +152,7 @@ typedef int pid_t;
 #define NT_THREADS
 #define USE_SOCKET
 #define WITH_THREAD
+#define WITH_FREE_THREAD
 #elif defined(__WINDOWS__)
 #define MS_WIN16
 #define MS_WINDOWS

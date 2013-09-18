@@ -36,6 +36,7 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "allobjects.h"
 #include "longintrepr.h"
 #include "mymath.h"
+#include "threadstate.h"
 #include <assert.h>
 #include <ctype.h>
 
@@ -48,11 +49,9 @@ static longobject *muladd1 PROTO((longobject *, wdigit, wdigit));
 static longobject *divrem1 PROTO((longobject *, wdigit, digit *));
 static object *long_format PROTO((object *aa, int base));
 
-static int ticker;	/* XXX Could be shared with ceval? */
-
 #define SIGCHECK(block) \
-	if (--ticker < 0) { \
-		ticker = 100; \
+	if (--pts->interp_ticker < 0) { \
+		pts->interp_ticker = pts->sys_checkinterval; \
 		if (sigcheck()) { block; } \
 	}
 
@@ -280,6 +279,7 @@ long_format(aa, base)
 	int base;
 {
 	register longobject *a = (longobject *)aa;
+	PyThreadState *pts = PyThreadState_Get();
 	stringobject *str;
 	int i;
 	int size_a = ABS(a->ob_size);
@@ -492,6 +492,7 @@ x_divrem(v1, w1, prem)
 	longobject *v1, *w1;
 	longobject **prem;
 {
+	PyThreadState *pts = PyThreadState_Get();
 	int size_v = ABS(v1->ob_size), size_w = ABS(w1->ob_size);
 	digit d = (twodigits)BASE / (w1->ob_digit[size_w-1] + 1);
 	longobject *v = mul1(v1, d);
@@ -821,6 +822,7 @@ long_mul(a, b)
 	longobject *a;
 	longobject *b;
 {
+	PyThreadState *pts = PyThreadState_Get();
 	int size_a;
 	int size_b;
 	longobject *z;

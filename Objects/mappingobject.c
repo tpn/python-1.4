@@ -39,7 +39,8 @@ PERFORMANCE OF THIS SOFTWARE.
 
 #include "allobjects.h"
 #include "modsupport.h"
-
+#include "pymutex.h"
+#include "pypooledlock.h"
 
 /*
 Table of primes suitable as keys, in ascending order.
@@ -84,11 +85,18 @@ when it is more than half filled.
 */
 typedef struct {
 	OB_HEAD
+	Py_DECLARE_POOLED_LOCK
 	int ma_fill;
 	int ma_used;
 	int ma_size;
 	mappingentry *ma_table;
 } mappingobject;
+
+#define Py_MAP_LOCK(mp)		Py_POOLED_LOCK((mappingobject *)(mp))
+#define Py_MAP_LOCK_TEST(mp,v)	Py_POOLED_LOCK_TEST((mappingobject *)(mp), (v))
+#define Py_MAP_UNLOCK(mp)	Py_POOLED_UNLOCK((mappingobject *)(mp))
+#define Py_MAP_LAZY_UNLOCK(mp)	Py_POOLED_LAZY_UNLOCK((mappingobject *)(mp))
+#define Py_MAP_LAZY_DONE(mp)	Py_POOLED_LAZY_DONE((mappingobject *)(mp))
 
 object *
 newmappingobject()
@@ -106,6 +114,7 @@ newmappingobject()
 	mp->ma_table = NULL;
 	mp->ma_fill = 0;
 	mp->ma_used = 0;
+	Py_POOLED_INIT(mp);
 	return (object *)mp;
 }
 
@@ -125,6 +134,20 @@ Subsequent probe indices are incr apart (mod table size), where incr
 is also derived from sum, with the additional requirement that it is
 relative prime to the table size (i.e., 1 <= incr < size, since the size
 is a prime number).  My choice for incr is somewhat arbitrary.
+*/
+/*
+** NOTE: we assume the mapping is locked on entry and exit (it must be
+** locked on exit so that the mappingentry remains valid).  To simplify
+** the whole system, we do NOT unlock the mapping when cmpobject() is
+** called.
+**
+** THEREFORE, if the key objects in a mapping have a __cmp__ method that
+** somehow refers back to the mapping, then a DEADLOCK may occur.
+**
+** NOTE: even in a non-threaded environment, if a __cmp__ method changes
+** the mapping, corruption may occur.  In a threaded environment, the
+** additional restriction of not being able to refer to the mapping
+** is also applied.
 */
 static mappingentry *lookmapping PROTO((mappingobject *, object *, long));
 static mappingentry *
@@ -169,13 +192,24 @@ Internal routine to insert a new item into the table.
 Used both by the internal resize routine and by the public insert routine.
 Eats a reference to key and one to value.
 */
+#ifdef WITH_FREE_THREAD
+static void insertmapping PROTO((mappingobject *, object *, long, object *, int));
+#else
 static void insertmapping PROTO((mappingobject *, object *, long, object *));
+#endif
 static void
-insertmapping(mp, key, hash, value)
+insertmapping(mp, key, hash, value
+#ifdef WITH_FREE_THREAD
+	      , handle_locks
+#endif
+    )
 	register mappingobject *mp;
 	object *key;
 	long hash;
 	object *value;
+#ifdef WITH_FREE_THREAD
+	int handle_locks;
+#endif
 {
 	object *old_value;
 	register mappingentry *ep;
@@ -183,18 +217,26 @@ insertmapping(mp, key, hash, value)
 	if (ep->me_value != NULL) {
 		old_value = ep->me_value;
 		ep->me_value = value;
+#ifdef WITH_FREE_THREAD
+		if ( handle_locks )
+			Py_MAP_UNLOCK(mp);
+#endif
 		DECREF(old_value); /* which **CAN** re-enter */
 		DECREF(key);
 	}
 	else {
-		if (ep->me_key == NULL)
+		old_value = ep->me_key;
+		if (old_value == NULL)
 			mp->ma_fill++;
-		else
-			DECREF(ep->me_key);
 		ep->me_key = key;
 		ep->me_hash = hash;
 		ep->me_value = value;
 		mp->ma_used++;
+#ifdef WITH_FREE_THREAD
+		if ( handle_locks )
+			Py_MAP_UNLOCK(mp);
+#endif
+		XDECREF(old_value);
 	}
 }
 
@@ -214,10 +256,13 @@ mappingresize(mp)
 	register mappingentry *newtable;
 	register mappingentry *ep;
 	register int i;
+
+	Py_MAP_LOCK_TEST(mp, -1);
 	newsize = mp->ma_size;
 	for (i = 0; ; i++) {
 		if (primes[i] <= 0) {
 			/* Ran out of primes */
+			Py_MAP_UNLOCK(mp);
 			err_nomem();
 			return -1;
 		}
@@ -225,6 +270,7 @@ mappingresize(mp)
 			newsize = primes[i];
 			if (newsize != primes[i]) {
 				/* Integer truncation */
+				Py_MAP_UNLOCK(mp);
 				err_nomem();
 				return -1;
 			}
@@ -233,6 +279,7 @@ mappingresize(mp)
 	}
 	newtable = (mappingentry *) calloc(sizeof(mappingentry), newsize);
 	if (newtable == NULL) {
+		Py_MAP_UNLOCK(mp);
 		err_nomem();
 		return -1;
 	}
@@ -245,8 +292,13 @@ mappingresize(mp)
 	   (and possible side effects) till the table is copied */
 	for (i = 0, ep = oldtable; i < oldsize; i++, ep++) {
 		if (ep->me_value != NULL)
-			insertmapping(mp,ep->me_key,ep->me_hash,ep->me_value);
+			insertmapping(mp,ep->me_key,ep->me_hash,ep->me_value
+#ifdef WITH_FREE_THREAD
+				      , 0	/* NO lock management */
+#endif
+				      );
 	}
+	Py_MAP_UNLOCK(mp);
 	for (i = 0, ep = oldtable; i < oldsize; i++, ep++) {
 		if (ep->me_value == NULL)
 			XDECREF(ep->me_key);
@@ -274,7 +326,17 @@ mappinglookup(op, key)
 	hash = hashobject(key);
 	if (hash == -1)
 		return NULL;
+#ifndef WITH_FREE_THREAD
 	return lookmapping((mappingobject *)op, key, hash) -> me_value;
+#else
+	{
+		object *value;
+		Py_MAP_LOCK_TEST(op, NULL);
+		value = lookmapping((mappingobject *)op, key, hash) -> me_value;
+		Py_MAP_UNLOCK(op);
+		return value;
+	}
+#endif
 }
 
 int
@@ -303,9 +365,14 @@ mappinginsert(op, key, value)
 				return -1;
 		}
 	}
+	Py_MAP_LOCK_TEST(mp, -1);
 	INCREF(value);
 	INCREF(key);
-	insertmapping(mp, key, hash, value);
+	insertmapping(mp, key, hash, value
+#ifdef WITH_FREE_THREAD
+		      , 1	/* do lock management */
+#endif
+	    );
 	return 0;
 }
 
@@ -332,8 +399,10 @@ mappingremove(op, key)
 	mp = (mappingobject *)op;
 	if (((mappingobject *)op)->ma_table == NULL)
 		goto empty;
+	Py_MAP_LOCK_TEST(mp, -1);
 	ep = lookmapping(mp, key, hash);
 	if (ep->me_value == NULL) {
+		Py_MAP_UNLOCK(mp);
 	empty:
 		err_setval(KeyError, key);
 		return -1;
@@ -344,6 +413,7 @@ mappingremove(op, key)
 	old_value = ep->me_value;
 	ep->me_value = NULL;
 	mp->ma_used--;
+	Py_MAP_UNLOCK(mp);
 	DECREF(old_value); 
 	DECREF(old_key); 
 	return 0;
@@ -359,12 +429,17 @@ mappingclear(op)
 	if (!is_mappingobject(op))
 		return;
 	mp = (mappingobject *)op;
-	table = mp->ma_table;
-	if (table == NULL)
+	if ( Py_MAP_LOCK(mp) )
 		return;
+	table = mp->ma_table;
+	if (table == NULL) {
+		Py_MAP_UNLOCK(mp);
+		return;
+	}
 	n = mp->ma_size;
 	mp->ma_size = mp->ma_used = mp->ma_fill = 0;
 	mp->ma_table = NULL;
+	Py_MAP_UNLOCK(mp);
 	for (i = 0; i < n; i++) {
 		XDECREF(table[i].me_key);
 		XDECREF(table[i].me_value);
@@ -372,6 +447,7 @@ mappingclear(op)
 	DEL(table);
 }
 
+/* WARNING: not thread-safe since it does not INCREF return values */
 int
 mappinggetnext(op, ppos, pkey, pvalue)
 	object *op;
@@ -414,6 +490,7 @@ mapping_dealloc(mp)
 			DECREF(ep->me_value);
 	}
 	XDEL(mp->ma_table);
+	Py_POOLED_LAZY_DONE(mp);
 	DEL(mp);
 }
 
@@ -428,6 +505,7 @@ mapping_print(mp, fp, flags)
 	register mappingentry *ep;
 	fprintf(fp, "{");
 	any = 0;
+#ifndef WITH_FREE_THREAD
 	for (i = 0, ep = mp->ma_table; i < mp->ma_size; i++, ep++) {
 		if (ep->me_value != NULL) {
 			if (any++ > 0)
@@ -439,6 +517,38 @@ mapping_print(mp, fp, flags)
 				return -1;
 		}
 	}
+#else
+	Py_MAP_LOCK_TEST(mp, -1);
+	for (i = 0, ep = mp->ma_table; i < mp->ma_size; i++, ep++) {
+		if (ep->me_value != NULL) {
+			object *key;
+			object *value;
+			int rc;
+			if (any++ > 0)
+				fprintf(fp, ", ");
+			key = ep->me_key;
+			value = ep->me_value;
+			INCREF(key);
+			INCREF(value);
+			Py_MAP_LAZY_UNLOCK(mp);
+			rc = printobject(key, fp, 0);
+			DECREF(key);
+			if (rc == 0) {
+				fprintf(fp, ": ");
+				rc = printobject(value, fp, 0);
+			}
+			DECREF(value);
+			if (rc != 0) {
+				Py_MAP_LAZY_DONE(mp);
+				return -1;
+			}
+			Py_MAP_LOCK_TEST(mp, -1);
+			/* re-establish the pointer */
+			ep = &mp->ma_table[i];
+		}
+	}
+	Py_MAP_UNLOCK(mp);
+#endif
 	fprintf(fp, "}");
 	return 0;
 }
@@ -456,6 +566,7 @@ mapping_repr(mp)
 	sepa = newstringobject(", ");
 	colon = newstringobject(": ");
 	any = 0;
+#ifndef WITH_FREE_THREAD
 	for (i = 0, ep = mp->ma_table; i < mp->ma_size && v; i++, ep++) {
 		if (ep->me_value != NULL) {
 			if (any++)
@@ -465,6 +576,42 @@ mapping_repr(mp)
 			joinstring_decref(&v, reprobject(ep->me_value));
 		}
 	}
+#else
+	if ( Py_MAP_LOCK(mp) ) {
+		XDECREF(v);
+		XDECREF(sepa);
+		XDECREF(colon);
+		return NULL;
+	}
+	for (i = 0, ep = mp->ma_table; i < mp->ma_size && v; i++, ep++) {
+		if (ep->me_value != NULL) {
+			object *key;
+			object *value;
+			key = ep->me_key;
+			value = ep->me_value;
+			INCREF(key);
+			INCREF(value);
+			Py_MAP_LAZY_UNLOCK(mp);
+
+			if (any++)
+				joinstring(&v, sepa);
+			joinstring_decref(&v, reprobject(key));
+			DECREF(key);
+			joinstring(&v, colon);
+			joinstring_decref(&v, reprobject(value));
+			DECREF(value);
+			if ( Py_MAP_LOCK(mp) ) {
+				XDECREF(v);
+				XDECREF(sepa);
+				XDECREF(colon);
+				return NULL;
+			}
+			/* re-establish the pointer */
+			ep = &mp->ma_table[i];
+		}
+	}
+	Py_MAP_UNLOCK(mp);
+#endif
 	joinstring_decref(&v, newstringobject("}"));
 	XDECREF(sepa);
 	XDECREF(colon);
@@ -495,11 +642,15 @@ mapping_subscript(mp, key)
 	hash = hashobject(key);
 	if (hash == -1)
 		return NULL;
+	Py_MAP_LOCK_TEST(mp, NULL);
 	v = lookmapping(mp, key, hash) -> me_value;
-	if (v == NULL)
+	if (v == NULL) {
+		Py_MAP_UNLOCK(mp);
 		err_setval(KeyError, key);
-	else
+	} else {
 		INCREF(v);
+		Py_MAP_UNLOCK(mp);
+	}
 	return v;
 }
 
@@ -532,6 +683,13 @@ mapping_keys(mp, args)
 	v = newlistobject(mp->ma_used);
 	if (v == NULL)
 		return NULL;
+
+	/* NOTE: we leave the mapping locked the whole time... this could
+	   theoretically deadlock in the weirdest of situations */
+	if ( Py_MAP_LOCK(mp) ) {
+		DECREF(v);
+		return NULL;
+	}
 	for (i = 0, j = 0; i < mp->ma_size; i++) {
 		if (mp->ma_table[i].me_value != NULL) {
 			object *key = mp->ma_table[i].me_key;
@@ -540,6 +698,7 @@ mapping_keys(mp, args)
 			j++;
 		}
 	}
+	Py_MAP_UNLOCK(mp);
 	return v;
 }
 
@@ -555,6 +714,13 @@ mapping_values(mp, args)
 	v = newlistobject(mp->ma_used);
 	if (v == NULL)
 		return NULL;
+
+	/* NOTE: we leave the mapping locked the whole time... this could
+	   theoretically deadlock in the weirdest of situations */
+	if ( Py_MAP_LOCK(mp) ) {
+		DECREF(v);
+		return NULL;
+	}
 	for (i = 0, j = 0; i < mp->ma_size; i++) {
 		if (mp->ma_table[i].me_value != NULL) {
 			object *value = mp->ma_table[i].me_value;
@@ -563,6 +729,7 @@ mapping_values(mp, args)
 			j++;
 		}
 	}
+	Py_MAP_UNLOCK(mp);
 	return v;
 }
 
@@ -578,12 +745,20 @@ mapping_items(mp, args)
 	v = newlistobject(mp->ma_used);
 	if (v == NULL)
 		return NULL;
+
+	/* NOTE: we leave the mapping locked the whole time... this could
+	   theoretically deadlock in the weirdest of situations */
+	if ( Py_MAP_LOCK(mp) ) {
+		DECREF(v);
+		return NULL;
+	}
 	for (i = 0, j = 0; i < mp->ma_size; i++) {
 		if (mp->ma_table[i].me_value != NULL) {
 			object *key = mp->ma_table[i].me_key;
 			object *value = mp->ma_table[i].me_value;
 			object *item = newtupleobject(2);
 			if (item == NULL) {
+				Py_MAP_UNLOCK(mp);
 				DECREF(v);
 				return NULL;
 			}
@@ -595,6 +770,7 @@ mapping_items(mp, args)
 			j++;
 		}
 	}
+	Py_MAP_UNLOCK(mp);
 	return v;
 }
 
@@ -674,7 +850,9 @@ mapping_compare(a, b)
 	}
 	sortlist(akeys);
 	sortlist(bkeys);
-	n = a->ma_used < b->ma_used ? a->ma_used : b->ma_used; /* smallest */
+	/* get the smallest */
+	n = ((listobject *)akeys)->ob_size < ((listobject *)bkeys)->ob_size ?
+	    ((listobject *)akeys)->ob_size : ((listobject *)bkeys)->ob_size;
 	res = 0;
 	for (i = 0; i < n; i++) {
 		object *akey, *bkey, *aval, *bval;
@@ -696,9 +874,34 @@ mapping_compare(a, b)
 		bhash = hashobject(bkey);
 		if (bhash == -1)
 			err_clear(); /* Don't want errors here */
+		if ( Py_MAP_LOCK(a) ) {
+			err_clear(); /* Don't want errors here */
+			break;
+		}
+		if ( Py_MAP_LOCK(b) ) {
+			err_clear(); /* Don't want errors here */
+			Py_MAP_UNLOCK(a);
+			break;
+		}
 		aval = lookmapping(a, akey, ahash) -> me_value;
 		bval = lookmapping(b, bkey, bhash) -> me_value;
+#ifdef WITH_FREE_THREAD
+		XINCREF(aval);
+		XINCREF(bval);
+		Py_MAP_LAZY_UNLOCK(a);
+		Py_MAP_LAZY_UNLOCK(b);
+		if ( aval == NULL || bval == NULL ) {
+			/* a key/value pair disappeared; we're done */
+			XDECREF(aval);
+			XDECREF(bval);
+			break;
+		}
+#endif
 		res = cmpobject(aval, bval);
+#ifdef WITH_FREE_THREAD
+		DECREF(aval);
+		DECREF(bval);
+#endif
 		if (res != 0)
 			break;
 	}
@@ -710,6 +913,8 @@ mapping_compare(a, b)
 	}
 	DECREF(akeys);
 	DECREF(bkeys);
+	Py_MAP_LAZY_DONE(a);
+	Py_MAP_LAZY_DONE(b);
 	return res;
 }
 
@@ -729,7 +934,9 @@ mapping_has_key(mp, args)
 	hash = hashobject(key);
 	if (hash == -1)
 		return NULL;
+	Py_MAP_LOCK_TEST(mp, NULL);
 	ok = mp->ma_size != 0 && lookmapping(mp, key, hash)->me_value != NULL;
+	Py_MAP_UNLOCK(mp);
 	return newintobject(ok);
 }
 
@@ -768,24 +975,54 @@ typeobject Mappingtype = {
 
 /* For backward compatibility with old dictionary interface */
 
-static object *last_name_object;
-static char *last_name_char; /* NULL or == getstringvalue(last_name_object) */
+static object *volatile last_name_object;
+static char *volatile last_name_char; /* NULL or == getstringvalue(last_name_object) */
 
 object *
 getattro(v, name)
 	object *v;
 	object *name;
 {
+	char *attr;
+
 	if (v->ob_type->tp_getattro != NULL)
 		return (*v->ob_type->tp_getattro)(v, name);
 
-	if (name != last_name_object) {
-		XDECREF(last_name_object);
-		INCREF(name);
-		last_name_object = name;
-		last_name_char = getstringvalue(name);
+#ifdef POSSIBLE_OPTIMIZATION
+	/* Note that 'name' is ref'd and that its string has longer scope
+	   than this function (implying last_name_object may have longer
+	   scope, too, meaning we can simply use the pointer in
+	   last_name_char, even if last_name_* subsequently change).
+	   This approach may also optimize future uses. */
+
+	Py_CRIT_LOCK();
+	if (name == last_name_object) {
+		attr = last_name_char;
+		Py_CRIT_UNLOCK();
 	}
-	return getattr(v, last_name_char);
+	else {
+		object *temp;
+
+		Py_CRIT_UNLOCK();
+
+		INCREF(name);	/* for storing in last_name_object */
+		attr = getstringvalue(name);
+
+		Py_CRIT_LOCK();
+		temp = last_name_object;
+		last_name_object = name;
+		last_name_char = attr;
+		Py_CRIT_UNLOCK();
+
+		XDECREF(temp);
+	}
+#else
+	attr = getstringvalue(name);
+	if ( !attr )
+		return NULL;
+#endif
+
+	return getattr(v, attr);
 }
 
 int
@@ -794,33 +1031,68 @@ setattro(v, name, value)
 	object *name;
 	object *value;
 {
+	char *attr;
+
 	if (v->ob_type->tp_setattro != NULL)
 		return (*v->ob_type->tp_setattro)(v, name, value);
 
-	if (name != last_name_object) {
-		XDECREF(last_name_object);
-		INCREF(name);
-		last_name_object = name;
-		last_name_char = getstringvalue(name);
+#ifdef POSSIBLE_OPTIMIZATION
+	/* Note that 'name' is ref'd and that its string has longer scope
+	   than this function (implying last_name_object may have longer
+	   scope, too, meaning we can simply use the pointer in
+	   last_name_char, even if last_name_* subsequently change).
+	   This approach may also optimize future uses. */
+
+	Py_CRIT_LOCK();
+	if (name == last_name_object) {
+		attr = last_name_char;
+		Py_CRIT_UNLOCK();
 	}
-	return setattr(v, last_name_char, value);
+	else {
+		object *temp;
+
+		Py_CRIT_UNLOCK();
+
+		INCREF(name);	/* for storing in last_name_object */
+		attr = getstringvalue(name);
+
+		Py_CRIT_LOCK();
+		temp = last_name_object;
+		last_name_object = name;
+		last_name_char = attr;
+		Py_CRIT_UNLOCK();
+
+		XDECREF(temp);
+	}
+#else
+	attr = getstringvalue(name);
+	if ( !attr )
+		return -1;
+#endif
+
+	return setattr(v, attr, value);
 }
+
+
+/*
+** NOTE: the routines below would not benefit from using last_name_object
+** and last_name_char.  There is no way to tell, based solely on the "key"
+** variable, whether the value of the key is the same as what was placed
+** into last_name_*.
+*/
 
 object *
 dictlookup(v, key)
 	object *v;
 	char *key;
 {
-	if (key != last_name_char) {
-		XDECREF(last_name_object);
-		last_name_object = newstringobject(key);
-		if (last_name_object == NULL) {
-			last_name_char = NULL;
-			return NULL;
-		}
-		last_name_char = getstringvalue(last_name_object);
-	}
-	return mappinglookup(v, last_name_object);
+	object *result;
+	object *keyo = newstringobject(key);
+	if ( keyo == NULL )
+		return NULL;
+	result = mappinglookup(v, keyo);
+	Py_DECREF(keyo);
+	return result;
 }
 
 int
@@ -829,16 +1101,14 @@ dictinsert(v, key, item)
 	char *key;
 	object *item;
 {
-	if (key != last_name_char) {
-		XDECREF(last_name_object);
-		last_name_object = newstringobject(key);
-		if (last_name_object == NULL) {
-			last_name_char = NULL;
-			return -1;
-		}
-		last_name_char = getstringvalue(last_name_object);
-	}
-	return mappinginsert(v, last_name_object, item);
+	int result;
+	object *keyo = newstringobject(key);
+	if ( keyo == NULL )
+		return -1;
+
+	result = mappinginsert(v, keyo, item);
+	Py_DECREF(keyo);
+	return result;
 }
 
 int
@@ -846,14 +1116,12 @@ dictremove(v, key)
 	object *v;
 	char *key;
 {
-	if (key != last_name_char) {
-		XDECREF(last_name_object);
-		last_name_object = newstringobject(key);
-		if (last_name_object == NULL) {
-			last_name_char = NULL;
-			return -1;
-		}
-		last_name_char = getstringvalue(last_name_object);
-	}
-	return mappingremove(v, last_name_object);
+	int result;
+	object *keyo = newstringobject(key);
+	if ( keyo == NULL )
+		return -1;
+
+	result = mappingremove(v, keyo);
+	Py_DECREF(keyo);
+	return result;
 }

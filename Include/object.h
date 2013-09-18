@@ -306,6 +306,10 @@ extern void _Py_ForgetReference Py_PROTO((PyObject *));
 extern void _Py_PrintReferences Py_PROTO((FILE *));
 #endif
 
+#ifdef WITH_FREE_THREAD
+#include <pymutex.h>		/* for Py_SafeIncr/Decr */
+#endif
+
 #ifndef Py_TRACE_REFS
 #ifdef COUNT_ALLOCS
 #define _Py_Dealloc(op) ((op)->ob_type->tp_free++, (*(op)->ob_type->tp_dealloc)((PyObject *)(op)))
@@ -346,12 +350,25 @@ extern long _Py_RefTotal;
 #define _Py_NewReference(op) ((op)->ob_refcnt = 1)
 #endif
 
+#ifdef WITH_FREE_THREAD
+
+#define Py_INCREF(op) Py_SafeIncr(&(op)->ob_refcnt)
+#define Py_DECREF(op) \
+	if (Py_SafeDecr(&(op)->ob_refcnt) != 0) \
+		; \
+	else \
+		_Py_Dealloc(op)
+
+#else /* !WITH_FREE_THREAD */
+
 #define Py_INCREF(op) ((op)->ob_refcnt++)
 #define Py_DECREF(op) \
 	if (--(op)->ob_refcnt != 0) \
 		; \
 	else \
 		_Py_Dealloc(op)
+
+#endif /* !WITH_FREE_THREAD */
 #endif /* !Py_REF_DEBUG */
 
 /* Macros to use in case the object pointer may be NULL: */

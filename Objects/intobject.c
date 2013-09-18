@@ -33,6 +33,7 @@ PERFORMANCE OF THIS SOFTWARE.
 
 #include "allobjects.h"
 #include "modsupport.h"
+#include "pymutex.h"
 
 #ifdef HAVE_LIMITS_H
 #include <limits.h>
@@ -93,13 +94,14 @@ err_ovf(msg)
 #define BLOCK_SIZE	1000	/* 1K less typical malloc overhead */
 #define N_INTOBJECTS	(BLOCK_SIZE / sizeof(intobject))
 
+/* WARNING: this function executed WITHIN critical section */
 static intobject *
 fill_free_list()
 {
 	intobject *p, *q;
 	p = NEW(intobject, N_INTOBJECTS);
 	if (p == NULL)
-		return (intobject *)err_nomem();
+		return NULL;	/* NOTE: LET CALLER RAISE ERROR */
 	q = p + N_INTOBJECTS;
 	while (--q > p)
 		*(intobject **)q = q-1;
@@ -107,7 +109,7 @@ fill_free_list()
 	return p + N_INTOBJECTS - 1;
 }
 
-static intobject *free_list = NULL;
+static intobject *volatile free_list = NULL;
 #ifndef NSMALLPOSINTS
 #define NSMALLPOSINTS		100
 #endif
@@ -120,7 +122,7 @@ static intobject *free_list = NULL;
    The integers that are saved are those in the range
    -NSMALLNEGINTS (inclusive) to NSMALLPOSINTS (not inclusive).
 */
-static intobject *small_ints[NSMALLNEGINTS + NSMALLPOSINTS];
+static intobject *volatile small_ints[NSMALLNEGINTS + NSMALLPOSINTS];
 #endif
 #ifdef COUNT_ALLOCS
 int quick_int_allocs, quick_neg_int_allocs;
@@ -144,12 +146,16 @@ newintobject(ival)
 		return (object *) v;
 	}
 #endif
+	Py_CRIT_LOCK();
 	if (free_list == NULL) {
-		if ((free_list = fill_free_list()) == NULL)
-			return NULL;
+		if ((free_list = fill_free_list()) == NULL) {
+			Py_CRIT_UNLOCK();
+			return err_nomem();
+		}
 	}
 	v = free_list;
 	free_list = *(intobject **)free_list;
+	Py_CRIT_UNLOCK();
 	v->ob_type = &Inttype;
 	v->ob_ival = ival;
 	NEWREF(v);
@@ -167,8 +173,10 @@ static void
 int_dealloc(v)
 	intobject *v;
 {
+	Py_CRIT_LOCK();
 	*(intobject **)v = free_list;
 	free_list = v;
+	Py_CRIT_UNLOCK();
 }
 
 long

@@ -46,6 +46,8 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "ceval.h"
 #include "import.h"
 #include "marshal.h"
+#include "pymutex.h"
+#include "threadstate.h"
 
 #ifdef HAVE_SIGNAL_H
 #include <signal.h>
@@ -87,6 +89,12 @@ initall()
 		return;
 	inited = 1;
 	
+#ifdef WITH_FREE_THREAD
+	PyMutex_Init();
+	PyPooledLock_Init();
+#endif
+	_PyThreadState_Init();
+
 	initimport();
 	
 	/* Modules '__builtin__' and 'sys' are initialized here,
@@ -581,20 +589,25 @@ fatal(msg)
 
 #ifdef WITH_THREAD
 #include "thread.h"
-int threads_started = 0; /* Set by threadmodule.c and maybe others */
+volatile int threads_started = 0; /* Set by threadmodule.c and maybe others */
 #endif
 
 #define NEXITFUNCS 32
 static void (*exitfuncs[NEXITFUNCS])();
-static int nexitfuncs = 0;
+static volatile int nexitfuncs = 0;	/* volatile -- used outside mutex */
 
 int Py_AtExit(func)
 	void (*func) PROTO((void));
 {
-	if (nexitfuncs >= NEXITFUNCS)
-		return -1;
-	exitfuncs[nexitfuncs++] = func;
-	return 0;
+	int ret = -1;
+
+	Py_CRIT_LOCK();
+	if (nexitfuncs < NEXITFUNCS) {
+		exitfuncs[nexitfuncs++] = func;
+		ret = 0;
+	}
+	Py_CRIT_UNLOCK();
+	return ret;
 }
 
 void
@@ -617,7 +630,14 @@ cleanup()
 	flushline();
 
 	while (nexitfuncs > 0)
-		(*exitfuncs[--nexitfuncs])();
+	{
+		void (*func) PROTO((void));
+
+		Py_CRIT_LOCK();
+		func = exitfuncs[--nexitfuncs];
+		Py_CRIT_UNLOCK();
+		(*func)();
+	}
 }
 
 #ifdef COUNT_ALLOCS

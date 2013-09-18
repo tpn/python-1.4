@@ -44,9 +44,6 @@ void PySys_Init Py_PROTO((void));
 void PySys_SetArgv Py_PROTO((int, char **));
 void PySys_SetPath Py_PROTO((char *));
 
-extern DL_IMPORT(PyObject *) _PySys_TraceFunc, *_PySys_ProfileFunc;
-extern DL_IMPORT(int) _PySys_CheckInterval;
-
 #ifdef __cplusplus
 }
 #endif

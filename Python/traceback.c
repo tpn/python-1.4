@@ -39,6 +39,7 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "traceback.h"
 #include "structmember.h"
 #include "osdefs.h"
+#include "threadstate.h"
 
 typedef struct _tracebackobject {
 	OB_HEAD
@@ -97,7 +98,7 @@ typeobject Tracebacktype = {
 
 static tracebackobject *
 newtracebackobject(next, frame, lasti, lineno)
-	tracebackobject *next;
+	object *next;
 	frameobject *frame;
 	int lasti, lineno;
 {
@@ -110,7 +111,7 @@ newtracebackobject(next, frame, lasti, lineno)
 	tb = NEWOBJ(tracebackobject, &Tracebacktype);
 	if (tb != NULL) {
 		XINCREF(next);
-		tb->tb_next = next;
+		tb->tb_next = (tracebackobject *)next;
 		XINCREF(frame);
 		tb->tb_frame = frame;
 		tb->tb_lasti = lasti;
@@ -119,27 +120,28 @@ newtracebackobject(next, frame, lasti, lineno)
 	return tb;
 }
 
-static tracebackobject *tb_current = NULL;
-
 int
 tb_here(frame)
 	frameobject *frame;
 {
+	PyThreadState *pts = PyThreadState_Get();
 	tracebackobject *tb;
-	tb = newtracebackobject(tb_current, frame, frame->f_lasti, frame->f_lineno);
+
+	tb = newtracebackobject(pts->last_traceback, frame, frame->f_lasti, frame->f_lineno);
 	if (tb == NULL)
 		return -1;
-	XDECREF(tb_current);
-	tb_current = tb;
+	XDECREF(pts->last_traceback);
+	pts->last_traceback = (object *)tb;
 	return 0;
 }
 
 object *
 tb_fetch()
 {
+	PyThreadState *pts = PyThreadState_Get();
 	object *v;
-	v = (object *)tb_current;
-	tb_current = NULL;
+	v = pts->last_traceback;
+	pts->last_traceback = NULL;
 	return v;
 }
 
@@ -147,13 +149,15 @@ int
 tb_store(v)
 	object *v;
 {
+	PyThreadState *pts = PyThreadState_Get();
+
 	if (v != NULL && !is_tracebackobject(v)) {
 		err_badcall();
 		return -1;
 	}
-	XDECREF(tb_current);
+	XDECREF(pts->last_traceback);
 	XINCREF(v);
-	tb_current = (tracebackobject *)v;
+	pts->last_traceback = v;
 	return 0;
 }
 

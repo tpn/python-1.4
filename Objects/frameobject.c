@@ -38,6 +38,7 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "opcode.h"
 #include "structmember.h"
 #include "bltinmodule.h"
+#include "pymutex.h"
 
 #define OFF(x) offsetof(frameobject, x)
 
@@ -98,7 +99,7 @@ frame_setattr(f, name, value)
    unless the program contains run-away recursion.  I hope.
 */
 
-static frameobject *free_list = NULL;
+static frameobject *volatile free_list = NULL;
 
 static void
 frame_dealloc(f)
@@ -112,8 +113,10 @@ frame_dealloc(f)
 	XDECREF(f->f_owner);
 	XDECREF(f->f_fastlocals);
 	XDECREF(f->f_trace);
+	Py_CRIT_LOCK();
 	f->f_back = free_list;
 	free_list = f;
+	Py_CRIT_UNLOCK();
 }
 
 typeobject Frametype = {
@@ -166,7 +169,9 @@ newframeobject(back, code, globals, locals, owner, nvalues, nblocks)
 		err_setstr(TypeError, "bad __builtins__ dictionary");
 		return NULL;
 	}
+	Py_CRIT_LOCK();
 	if (free_list == NULL) {
+		Py_CRIT_UNLOCK();
 		f = NEWOBJ(frameobject, &Frametype);
 		if (f == NULL)
 			return NULL;
@@ -177,6 +182,7 @@ newframeobject(back, code, globals, locals, owner, nvalues, nblocks)
 	else {
 		f = free_list;
 		free_list = free_list->f_back;
+		Py_CRIT_UNLOCK();
 		f->ob_type = &Frametype;
 		NEWREF(f);
 	}

@@ -50,9 +50,8 @@ Data members:
 #include "import.h"
 #include "modsupport.h"
 #include "osdefs.h"
-
-object *sys_trace, *sys_profile;
-int sys_checkinterval = 10;
+#include "threadstate.h"
+#include "pymutex.h"
 
 static object *sysdict;
 
@@ -111,12 +110,22 @@ sys_settrace(self, args)
 	object *self;
 	object *args;
 {
+	PyThreadState *pts = PyThreadState_Get();
+	object *old = pts->sys_tracefunc;
+
 	if (args == None)
 		args = NULL;
 	else
 		XINCREF(args);
-	XDECREF(sys_trace);
-	sys_trace = args;
+
+	/* if another thread is starting and this thread is the main thread,
+	   then it might read this data. Guard with a lock. */
+	Py_CRIT_LOCK();
+	pts->sys_tracefunc = args;
+	Py_CRIT_UNLOCK();
+
+	XDECREF(old);
+
 	INCREF(None);
 	return None;
 }
@@ -126,12 +135,22 @@ sys_setprofile(self, args)
 	object *self;
 	object *args;
 {
+	PyThreadState *pts = PyThreadState_Get();
+	object *old = pts->sys_profilefunc;
+
 	if (args == None)
 		args = NULL;
 	else
 		XINCREF(args);
-	XDECREF(sys_profile);
-	sys_profile = args;
+
+	/* if another thread is starting and this thread is the main thread,
+	   then it might read this data. Guard with a lock. */
+	Py_CRIT_LOCK();
+	pts->sys_profilefunc = args;
+	Py_CRIT_UNLOCK();
+
+	XDECREF(old);
+
 	INCREF(None);
 	return None;
 }
@@ -141,7 +160,9 @@ sys_setcheckinterval(self, args)
 	object *self;
 	object *args;
 {
-	if (!newgetargs(args, "i", &sys_checkinterval))
+	PyThreadState *pts = PyThreadState_Get();
+
+	if (!newgetargs(args, "i", &pts->sys_checkinterval))
 		return NULL;
 	INCREF(None);
 	return None;
@@ -212,8 +233,6 @@ static struct methodlist sys_methods[] = {
 	{NULL,		NULL}		/* sentinel */
 };
 
-static object *sysin, *sysout, *syserr;
-
 static object *
 list_builtin_module_names()
 {
@@ -247,6 +266,8 @@ initsys()
 	extern int fclose PROTO((FILE *));
 	object *m = initmodule("sys", sys_methods);
 	object *v;
+	object *sysin, *sysout, *syserr;
+
 	sysdict = getmoduledict(m);
 	INCREF(sysdict);
 	/* NB keep an extra ref to the std files to avoid closing them

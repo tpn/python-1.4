@@ -64,6 +64,7 @@ PERFORMANCE OF THIS SOFTWARE.
 
 #include "allobjects.h"
 #include "traceback.h"
+#include "threadstate.h"
 
 #include <errno.h>
 
@@ -85,21 +86,18 @@ extern char *PyMac_StrError PROTO((int));
 extern char *strerror PROTO((int));
 #endif
 
-/* Last exception stored by err_setval() */
-
-static object *last_exception;
-static object *last_exc_val;
-
 void
 err_restore(exception, value, traceback)
 	object *exception;
 	object *value;
 	object *traceback;
 {
+	PyThreadState *pts = PyThreadState_Get();
+
 	err_clear();
 
-	last_exception = exception;
-	last_exc_val = value;
+	pts->last_exception = exception;
+	pts->last_exc_val = value;
 	(void) tb_store(traceback);
 	XDECREF(traceback);
 }
@@ -135,7 +133,9 @@ err_setstr(exception, string)
 object *
 err_occurred()
 {
-	return last_exception;
+	PyThreadState *pts = PyThreadState_Get();
+
+	return pts->last_exception;
 }
 
 void
@@ -144,10 +144,12 @@ err_fetch(p_exc, p_val, p_tb)
 	object **p_val;
 	object **p_tb;
 {
-	*p_exc = last_exception;
-	last_exception = NULL;
-	*p_val = last_exc_val;
-	last_exc_val = NULL;
+	PyThreadState *pts = PyThreadState_Get();
+
+	*p_exc = pts->last_exception;
+	pts->last_exception = NULL;
+	*p_val = pts->last_exc_val;
+	pts->last_exc_val = NULL;
 	*p_tb = tb_fetch();
 }
 
@@ -155,10 +157,12 @@ void
 err_clear()
 {
 	object *tb;
-	XDECREF(last_exception);
-	last_exception = NULL;
-	XDECREF(last_exc_val);
-	last_exc_val = NULL;
+	PyThreadState *pts = PyThreadState_Get();
+
+	XDECREF(pts->last_exception);
+	pts->last_exception = NULL;
+	XDECREF(pts->last_exc_val);
+	pts->last_exc_val = NULL;
 	/* Also clear interpreter stack trace */
 	tb = tb_fetch();
 	XDECREF(tb);

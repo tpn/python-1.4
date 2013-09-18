@@ -32,6 +32,7 @@ PERFORMANCE OF THIS SOFTWARE.
 /* String object implementation */
 
 #include "allobjects.h"
+#include "threadstate.h"
 
 #include <ctype.h>
 
@@ -47,7 +48,7 @@ int null_strings, one_strings;
 #endif
 #endif
 
-static stringobject *characters[UCHAR_MAX + 1];
+static stringobject *volatile characters[UCHAR_MAX + 1];
 #ifndef DONT_SHARE_SHORT_STRINGS
 static stringobject *nullstring;
 #endif
@@ -568,8 +569,9 @@ formatfloat(flags, prec, type, v)
 	int type;
 	object *v;
 {
+	PyThreadState *pts = PyThreadState_Get();
 	char fmt[20];
-	static char buf[120];
+
 	double x;
 	if (!getargs(v, "d;float argument required", &x))
 		return NULL;
@@ -580,8 +582,8 @@ formatfloat(flags, prec, type, v)
 	if (type == 'f' && fabs(x)/1e25 >= 1e25)
 		type = 'g';
 	sprintf(fmt, "%%%s.%d%c", (flags&F_ALT) ? "#" : "", prec, type);
-	sprintf(buf, fmt, x);
-	return buf;
+	sprintf(pts->work_buf, fmt, x);
+	return pts->work_buf;
 }
 
 static char *
@@ -591,33 +593,35 @@ formatint(flags, prec, type, v)
 	int type;
 	object *v;
 {
+	PyThreadState *pts = PyThreadState_Get();
 	char fmt[20];
-	static char buf[50];
+
 	long x;
 	if (!getargs(v, "l;int argument required", &x))
 		return NULL;
 	if (prec < 0)
 		prec = 1;
 	sprintf(fmt, "%%%s.%dl%c", (flags&F_ALT) ? "#" : "", prec, type);
-	sprintf(buf, fmt, x);
-	return buf;
+	sprintf(pts->work_buf, fmt, x);
+	return pts->work_buf;
 }
 
 static char *
 formatchar(v)
 	object *v;
 {
-	static char buf[2];
+	PyThreadState *pts = PyThreadState_Get();
+
 	if (is_stringobject(v)) {
-		if (!getargs(v, "c;%c requires int or char", &buf[0]))
+		if (!getargs(v, "c;%c requires int or char", &pts->work_buf[0]))
 			return NULL;
 	}
 	else {
-		if (!getargs(v, "b;%c requires int or char", &buf[0]))
+		if (!getargs(v, "b;%c requires int or char", &pts->work_buf[0]))
 			return NULL;
 	}
-	buf[1] = '\0';
-	return buf;
+	pts->work_buf[1] = '\0';
+	return pts->work_buf;
 }
 
 

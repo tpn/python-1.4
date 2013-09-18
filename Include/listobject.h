@@ -35,6 +35,8 @@ PERFORMANCE OF THIS SOFTWARE.
 
 ******************************************************************/
 
+#include "pypooledlock.h"
+
 /* List object interface */
 
 /*
@@ -53,6 +55,7 @@ returned item's reference count.
 
 typedef struct {
 	PyObject_VAR_HEAD
+	Py_DECLARE_POOLED_LOCK
 	PyObject **ob_item;
 } PyListObject;
 

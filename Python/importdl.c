@@ -35,6 +35,7 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "allobjects.h"
 #include "osdefs.h"
 #include "importdl.h"
+#include "pymutex.h"
 
 /* Explanation of some of the the various #defines used by dynamic linking...
 
@@ -246,38 +247,70 @@ load_dynamic_module(name, pathname, fp)
 	object *m, *d, *s;
 	char funcname[258];
 	dl_funcptr p = NULL;
-#ifdef USE_SHLIB
-	static struct {
-		dev_t dev;
-		ino_t ino;
-		void *handle;
-	} handles[128];
-	static int nhandles = 0;
-	char pathbuf[260];
-	if (strchr(pathname, '/') == NULL) {
-		/* Prefix bare filename with "./" */
-		sprintf(pathbuf, "./%-.255s", pathname);
-		pathname = pathbuf;
-	}
-#endif
+
 	sprintf(funcname, FUNCNAME_PATTERN, name);
 #ifdef USE_SHLIB
-	if (fp != NULL) {
-		int i;
+	{
+		/* not volatile -- always accessed within mutex */
+		static struct {
+			dev_t dev;
+			ino_t ino;
+			void *handle;
+		} handles[128];
+		static int nhandles = 0;
 		struct stat statb;
-		fstat(fileno(fp), &statb);
-		for (i = 0; i < nhandles; i++) {
-			if (statb.st_dev == handles[i].dev &&
-			    statb.st_ino == handles[i].ino) {
-				p = (dl_funcptr) dlsym(handles[i].handle,
-						       funcname);
-				goto got_it;
+		char pathbuf[260];
+		void *handle;
+
+		if (strchr(pathname, '/') == NULL) {
+			/* Prefix bare filename with "./" */
+			sprintf(pathbuf, "./%-.255s", pathname);
+			pathname = pathbuf;
+		}
+
+		if (fp != NULL) {
+			int i;
+			fstat(fileno(fp), &statb);
+
+			/* make sure the same module won't occur twice */
+			Py_CRIT_LOCK();
+
+			for (i = 0; i < nhandles; i++) {
+				if (statb.st_dev == handles[i].dev &&
+				    statb.st_ino == handles[i].ino) {
+					Py_CRIT_UNLOCK();
+					p = (dl_funcptr) dlsym(handles[i].handle,
+							       funcname);
+					goto got_it;
+				}
 			}
 		}
-		if (nhandles < 128) {
-			handles[nhandles].dev = statb.st_dev;
-			handles[nhandles].ino = statb.st_ino;
+
+#ifdef RTLD_NOW
+		/* RTLD_NOW: resolve externals now
+		   (i.e. core dump now if some are missing) */
+		handle = dlopen(pathname, RTLD_NOW);
+#else
+		if (verbose)
+			printf("dlopen(\"%s\", %d);\n", pathname, RTLD_LAZY);
+		handle = dlopen(pathname, RTLD_LAZY);
+#endif /* RTLD_NOW */
+		if (handle == NULL) {
+			if (fp != NULL)
+				Py_CRIT_UNLOCK();
+			err_setstr(ImportError, dlerror());
+			return NULL;
 		}
+		if (fp != NULL) {
+			if (nhandles < 128) {
+				handles[nhandles].dev = statb.st_dev;
+				handles[nhandles].ino = statb.st_ino;
+				handles[nhandles].handle = handle;
+				++nhandles;
+			}
+			Py_CRIT_UNLOCK();
+		}
+		p = (dl_funcptr) dlsym(handle, funcname);
 	}
 #endif /* USE_SHLIB */
 #ifdef USE_MAC_DYNAMIC_LOADING
@@ -334,27 +367,6 @@ load_dynamic_module(name, pathname, fp)
 		p = (dl_funcptr)symAddr;
 	}
 #endif /* USE_MAC_DYNAMIC_LOADING */
-#ifdef USE_SHLIB
-	{
-#ifdef RTLD_NOW
-		/* RTLD_NOW: resolve externals now
-		   (i.e. core dump now if some are missing) */
-		void *handle = dlopen(pathname, RTLD_NOW);
-#else
-		void *handle;
-		if (verbose)
-			printf("dlopen(\"%s\", %d);\n", pathname, RTLD_LAZY);
-		handle = dlopen(pathname, RTLD_LAZY);
-#endif /* RTLD_NOW */
-		if (handle == NULL) {
-			err_setstr(ImportError, dlerror());
-			return NULL;
-		}
-		if (fp != NULL && nhandles < 128)
-			handles[nhandles++].handle = handle;
-		p = (dl_funcptr) dlsym(handle, funcname);
-	}
-#endif /* USE_SHLIB */
 #ifdef _AIX
 	/*
 	-- Invoke load() with L_NOAUTODEFER leaving the imported symbols

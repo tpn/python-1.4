@@ -12,9 +12,6 @@ EXPORTS
 	_Py_TrueStruct DATA
 	Py_DebugFlag DATA
 	_PyParser_Grammar DATA
-	_PySys_ProfileFunc DATA
-	_PySys_TraceFunc DATA
-	_PySys_CheckInterval DATA
 	_PyThread_Started DATA
 	_PyParser_TokenNames DATA
 	Py_VerboseFlag DATA
@@ -349,3 +346,5 @@ EXPORTS
 	_Py_c_sum
 	_Py_c_prod
 	_Py_c_diff
+	PyThreadState_Ensure
+	PyThreadState_Free

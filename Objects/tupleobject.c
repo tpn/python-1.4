@@ -32,6 +32,7 @@ PERFORMANCE OF THIS SOFTWARE.
 /* Tuple object implementation */
 
 #include "allobjects.h"
+#include "pymutex.h"
 
 #ifndef MAXSAVESIZE
 #define MAXSAVESIZE	20
@@ -41,7 +42,7 @@ PERFORMANCE OF THIS SOFTWARE.
 /* Entries 1 upto MAXSAVESIZE are free lists, entry 0 is the empty
    tuple () of which at most one instance will be allocated.
 */
-static tupleobject *free_tuples[MAXSAVESIZE];
+static tupleobject * volatile free_tuples[MAXSAVESIZE];
 #endif
 #ifdef COUNT_ALLOCS
 int fast_tuple_allocs;
@@ -67,12 +68,19 @@ newtupleobject(size)
 #endif
 		return (object *) op;
 	}
-	if (0 < size && size < MAXSAVESIZE && (op = free_tuples[size]) != NULL) {
+	op = NULL;
+	if (0 < size && size < MAXSAVESIZE )
+	{
+	    Py_CRIT_LOCK();
+	    if ((op = free_tuples[size]) != NULL) {
 		free_tuples[size] = (tupleobject *) op->ob_item[0];
 #ifdef COUNT_ALLOCS
 		fast_tuple_allocs++;
 #endif
-	} else
+	    }
+	    Py_CRIT_UNLOCK();
+	}
+	if (op == NULL )
 #endif
 	{
 		op = (tupleobject *)
@@ -158,8 +166,10 @@ tupledealloc(op)
 		XDECREF(op->ob_item[i]);
 #if MAXSAVESIZE > 0
 	if (0 < op->ob_size && op->ob_size < MAXSAVESIZE) {
+		Py_CRIT_LOCK();
 		op->ob_item[0] = (object *) free_tuples[op->ob_size];
 		free_tuples[op->ob_size] = op;
+		Py_CRIT_UNLOCK();
 	} else
 #endif
 		free((ANY *)op);

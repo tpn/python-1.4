@@ -34,13 +34,25 @@ PERFORMANCE OF THIS SOFTWARE.
 #include "allobjects.h"
 #include "modsupport.h"
 #include "ceval.h"
+#include "threadstate.h"
 #ifdef STDC_HEADERS
 #include <stddef.h>
 #else
 #include <sys/types.h>		/* For size_t */
 #endif
 
+#define Py_LIST_LOCK(op)	Py_POOLED_LOCK((listobject *)(op))
+#define Py_LIST_LOCK_TEST(op,v)	Py_POOLED_LOCK_TEST((listobject *)(op), (v))
+#define Py_LIST_UNLOCK(op)	Py_POOLED_UNLOCK((listobject *)(op))
+#define Py_LIST_LAZY_UNLOCK(op)	Py_POOLED_LAZY_UNLOCK((listobject *)(op))
+#define Py_LIST_LAZY_DONE(op)	Py_POOLED_LAZY_DONE((listobject *)(op))
+
 #define ROUNDUP(n, block) ((((n)+(block)-1)/(block))*(block))
+
+/* some systems define a roundup() macro */
+#ifdef roundup
+#undef roundup
+#endif
 
 static int
 roundup(n)
@@ -86,6 +98,7 @@ newlistobject(size)
 	}
 	op->ob_type = &Listtype;
 	op->ob_size = size;
+	Py_POOLED_INIT(op);
 	for (i = 0; i < size; i++)
 		op->ob_item[i] = NULL;
 	NEWREF(op);
@@ -106,6 +119,7 @@ getlistsize(op)
 
 static object *indexerr;
 
+/* WARNING: THIS FUNCTION IS *NOT* THREAD SAFE */
 object *
 getlistitem(op, i)
 	object *op;
@@ -137,7 +151,9 @@ setlistitem(op, i, newitem)
 		err_badcall();
 		return -1;
 	}
+	Py_LIST_LOCK_TEST(op, -1);
 	if (i < 0 || i >= ((listobject *)op) -> ob_size) {
+		Py_LIST_UNLOCK(op);
 		XDECREF(newitem);
 		err_setstr(IndexError, "list assignment index out of range");
 		return -1;
@@ -145,6 +161,7 @@ setlistitem(op, i, newitem)
 	p = ((listobject *)op) -> ob_item + i;
 	olditem = *p;
 	*p = newitem;
+	Py_LIST_UNLOCK(op);
 	XDECREF(olditem);
 	return 0;
 }
@@ -161,9 +178,11 @@ ins1(self, where, v)
 		err_badcall();
 		return -1;
 	}
+	Py_LIST_LOCK_TEST(self, -1);
 	items = self->ob_item;
 	NRESIZE(items, object *, self->ob_size+1);
 	if (items == NULL) {
+		Py_LIST_UNLOCK(self);
 		err_nomem();
 		return -1;
 	}
@@ -177,6 +196,7 @@ ins1(self, where, v)
 	items[where] = v;
 	self->ob_item = items;
 	self->ob_size++;
+	Py_LIST_UNLOCK(self);
 	return 0;
 }
 
@@ -206,6 +226,7 @@ addlistitem(op, newitem)
 		(int) ((listobject *)op)->ob_size, newitem);
 }
 
+
 /* Methods */
 
 static void
@@ -219,6 +240,7 @@ list_dealloc(op)
 		}
 		free((ANY *)op->ob_item);
 	}
+	Py_POOLED_LAZY_DONE(op);
 	free((ANY *)op);
 }
 
@@ -231,12 +253,35 @@ list_print(op, fp, flags)
 	int i;
 	fprintf(fp, "[");
 	for (i = 0; i < op->ob_size; i++) {
+		object *o;
+		int rc;
+
 		if (i > 0)
 			fprintf(fp, ", ");
-		if (printobject(op->ob_item[i], fp, 0) != 0)
+
+#ifdef WITH_FREE_THREAD
+		Py_LIST_LOCK_TEST(op, -1);
+		if ( i >= op->ob_size ) {
+			Py_LIST_UNLOCK(op);
+			break;
+		}
+		o = op->ob_item[i];
+		Py_INCREF(o);
+		Py_LIST_LAZY_UNLOCK(op);
+
+		rc = printobject(o, fp, 0);
+		Py_DECREF(o);
+#else
+		rc = printobject(op->ob_item[i], fp, 0);
+#endif
+
+		if ( rc != 0 ) {
+			Py_LIST_LAZY_DONE(op);
 			return -1;
+		}
 	}
 	fprintf(fp, "]");
+	Py_LIST_LAZY_DONE(op);
 	return 0;
 }
 
@@ -251,8 +296,26 @@ list_repr(v)
 	for (i = 0; i < v->ob_size && s != NULL; i++) {
 		if (i > 0)
 			joinstring(&s, comma);
+#ifdef WITH_FREE_THREAD
+		if ( Py_LIST_LOCK(v) ) {
+			Py_XDECREF(s);
+			s = NULL;
+			break;
+		} else if ( i < v->ob_size ) {
+			object *o = v->ob_item[i];
+			Py_INCREF(o);
+			Py_LIST_LAZY_UNLOCK(v);
+
+			joinstring_decref(&s, reprobject(o));
+			Py_DECREF(o);
+		} else {
+			Py_LIST_UNLOCK(v);
+		}
+#else
 		joinstring_decref(&s, reprobject(v->ob_item[i]));
+#endif
 	}
+	Py_LIST_LAZY_DONE(v);
 	XDECREF(comma);
 	joinstring_decref(&s, newstringobject("]"));
 	return s;
@@ -262,6 +325,8 @@ static int
 list_compare(v, w)
 	listobject *v, *w;
 {
+#ifndef WITH_FREE_THREAD
+
 	int len = (v->ob_size < w->ob_size) ? v->ob_size : w->ob_size;
 	int i;
 	for (i = 0; i < len; i++) {
@@ -270,6 +335,48 @@ list_compare(v, w)
 			return cmp;
 	}
 	return v->ob_size - w->ob_size;
+
+#else
+
+	int len = (v->ob_size < w->ob_size) ? v->ob_size : w->ob_size;
+	int i;
+	for (i = 0; i < len; i++) {
+		object *o1;
+		object *o2;
+		int cmp;
+
+		Py_LIST_LOCK_TEST(v, -1);
+		if ( i >= v->ob_size ) {
+			Py_LIST_UNLOCK(v);
+			break;
+		}
+		o1 = v->ob_item[i];
+		Py_INCREF(o1);
+		Py_LIST_LAZY_UNLOCK(v);
+
+		Py_LIST_LOCK_TEST(w, -1);
+		if ( i >= w->ob_size ) {
+			Py_LIST_UNLOCK(w);
+			break;
+		}
+		o2 = w->ob_item[i];
+		Py_INCREF(o2);
+		Py_LIST_LAZY_UNLOCK(w);
+
+		cmp = cmpobject(o1, o2);
+		Py_DECREF(o1);
+		Py_DECREF(o2);
+		if (cmp != 0) {
+			Py_LIST_LAZY_DONE(v);
+			Py_LIST_LAZY_DONE(w);
+			return cmp;
+		}
+	}
+	Py_LIST_LAZY_DONE(v);
+	Py_LIST_LAZY_DONE(w);
+	return v->ob_size - w->ob_size;
+
+#endif
 }
 
 static int
@@ -284,14 +391,19 @@ list_item(a, i)
 	listobject *a;
 	int i;
 {
+	object *o;
+	Py_LIST_LOCK_TEST(a, NULL);
 	if (i < 0 || i >= a->ob_size) {
+		Py_LIST_UNLOCK(a);
 		if (indexerr == NULL)
 			indexerr = newstringobject("list index out of range");
 		err_setval(IndexError, indexerr);
 		return NULL;
 	}
-	INCREF(a->ob_item[i]);
-	return a->ob_item[i];
+	o = a->ob_item[i];
+	INCREF(o);
+	Py_LIST_UNLOCK(a);
+	return o;
 }
 
 static object *
@@ -301,24 +413,43 @@ list_slice(a, ilow, ihigh)
 {
 	listobject *np;
 	int i;
+	int size = a->ob_size;
+
+	Py_LIST_LOCK_TEST(a, NULL);
 	if (ilow < 0)
 		ilow = 0;
-	else if (ilow > a->ob_size)
-		ilow = a->ob_size;
+	else if (ilow > size)
+		ilow = size;
 	if (ihigh < 0)
 		ihigh = 0;
 	if (ihigh < ilow)
 		ihigh = ilow;
-	else if (ihigh > a->ob_size)
-		ihigh = a->ob_size;
+	else if (ihigh > size)
+		ihigh = size;
+	Py_LIST_LAZY_UNLOCK(a);
 	np = (listobject *) newlistobject(ihigh - ilow);
-	if (np == NULL)
+	if (np == NULL) {
+		Py_LIST_LAZY_DONE(a);
 		return NULL;
+	}
+	if ( Py_LIST_LOCK(a) ) {
+		Py_DECREF(np);
+		return NULL;
+	}
+	/* see if self changed while it was unlocked... */
+	if ( a->ob_size < size ) {
+		if (ilow > a->ob_size)
+			ilow = a->ob_size;
+		if (ihigh > a->ob_size)
+			ihigh = a->ob_size;
+		np->ob_size = ihigh - ilow;
+	}
 	for (i = ilow; i < ihigh; i++) {
 		object *v = a->ob_item[i];
 		INCREF(v);
 		np->ob_item[i - ilow] = v;
 	}
+	Py_LIST_UNLOCK(a);
 	return (object *)np;
 }
 
@@ -339,7 +470,8 @@ list_concat(a, bb)
 	listobject *a;
 	object *bb;
 {
-	int size;
+	int asize;
+	int bsize;
 	int i;
 	listobject *np;
 	if (!is_listobject(bb)) {
@@ -347,21 +479,41 @@ list_concat(a, bb)
 		return NULL;
 	}
 #define b ((listobject *)bb)
-	size = a->ob_size + b->ob_size;
-	np = (listobject *) newlistobject(size);
+	asize = a->ob_size;
+	bsize = b->ob_size;
+	np = (listobject *) newlistobject(asize + bsize);
 	if (np == NULL) {
 		return NULL;
 	}
-	for (i = 0; i < a->ob_size; i++) {
+	if ( Py_LIST_LOCK(a) ) {
+		Py_DECREF(np);
+		return NULL;
+	}
+	if ( Py_LIST_LOCK(b) ) {
+		Py_LIST_UNLOCK(a);
+		Py_DECREF(np);
+		return NULL;
+	}
+	if ( a->ob_size < asize ) {
+		asize = a->ob_size;
+		np->ob_size = asize + bsize;
+	}
+	if ( b->ob_size < bsize ) {
+		bsize = b->ob_size;
+		np->ob_size = asize + bsize;
+	}
+	for (i = 0; i < asize; i++) {
 		object *v = a->ob_item[i];
 		INCREF(v);
 		np->ob_item[i] = v;
 	}
-	for (i = 0; i < b->ob_size; i++) {
+	for (i = 0; i < bsize; i++) {
 		object *v = b->ob_item[i];
 		INCREF(v);
-		np->ob_item[i + a->ob_size] = v;
+		np->ob_item[i + asize] = v;
 	}
+	Py_LIST_UNLOCK(a);
+	Py_LIST_UNLOCK(b);
 	return (object *)np;
 #undef b
 }
@@ -377,18 +529,27 @@ list_repeat(a, n)
 	object **p;
 	if (n < 0)
 		n = 0;
-	size = a->ob_size * n;
-	np = (listobject *) newlistobject(size);
+	size = a->ob_size;
+	np = (listobject *) newlistobject(size * n);
 	if (np == NULL)
 		return NULL;
+	if ( Py_LIST_LOCK(a) ) {
+		Py_DECREF(np);
+		return NULL;
+	}
+	if ( a->ob_size < size ) {
+		size = a->ob_size;
+		np->ob_size = size * n;
+	}
 	p = np->ob_item;
 	for (i = 0; i < n; i++) {
-		for (j = 0; j < a->ob_size; j++) {
+		for (j = 0; j < size; j++) {
 			*p = a->ob_item[j];
 			INCREF(*p);
 			p++;
 		}
 	}
+	Py_LIST_UNLOCK(a);
 	return (object *) np;
 }
 
@@ -427,6 +588,14 @@ list_ass_slice(a, ilow, ihigh, v)
 		err_badarg();
 		return -1;
 	}
+	Py_LIST_LOCK_TEST(a, -1);
+	if ( b != NULL ) {
+		if ( Py_LIST_LOCK(b) ) {
+			Py_LIST_UNLOCK(a);
+			return -1;
+		}
+		n = b->ob_size;
+	}
 	if (ilow < 0)
 		ilow = 0;
 	else if (ilow > a->ob_size)
@@ -457,6 +626,9 @@ list_ass_slice(a, ilow, ihigh, v)
 	else { /* Insert d items; recycle ihigh-ilow items */
 		NRESIZE(item, object *, a->ob_size + d);
 		if (item == NULL) {
+			Py_LIST_UNLOCK(a);
+			if ( b )
+				Py_LIST_UNLOCK(b);
 			XDEL(recycle);
 			err_nomem();
 			return -1;
@@ -473,6 +645,9 @@ list_ass_slice(a, ilow, ihigh, v)
 		XINCREF(w);
 		item[ilow] = w;
 	}
+	Py_LIST_UNLOCK(a);
+	if ( b )
+		Py_LIST_UNLOCK(b);
 	if (recycle) {
 		while (--p >= recycle)
 			XDECREF(*p);
@@ -508,9 +683,16 @@ list_ass_item(a, i, v)
 	}
 	if (v == NULL)
 		return list_ass_slice(a, i, i+1, v);
+	Py_LIST_LOCK_TEST(a, -1);
+	if (i >= a->ob_size) {
+		Py_LIST_UNLOCK(a);
+		err_setstr(IndexError, "list assignment index out of range");
+		return -1;
+	}
 	INCREF(v);
 	old_value = a->ob_item[i];
 	a->ob_item[i] = v;
+	Py_LIST_UNLOCK(a);
 	DECREF(old_value); 
 	return 0;
 }
@@ -550,26 +732,26 @@ listappend(self, args)
 	return ins(self, (int) self->ob_size, v);
 }
 
-static object *comparefunc;
-
 static int
 cmp(v, w)
 	const ANY *v, *w;
 {
 	object *t, *res;
 	long i;
+	PyThreadState *pts = PyThreadState_Get();
+
 
 	if (err_occurred())
 		return 0;
 
-	if (comparefunc == NULL)
+	if (pts->sort_comparefunc == NULL)
 		return cmpobject(* (object **) v, * (object **) w);
 
 	/* Call the user-supplied comparison function */
 	t = mkvalue("(OO)", * (object **) v, * (object **) w);
 	if (t == NULL)
 		return 0;
-	res = call_object(comparefunc, t);
+	res = call_object(pts->sort_comparefunc, t);
 	DECREF(t);
 	if (res == NULL)
 		return 0;
@@ -594,23 +776,31 @@ listsort(self, args)
 	object *args;
 {
 	object *save_comparefunc;
+	PyThreadState *pts = PyThreadState_Get();
+
+	/* ### WARNING: IT IS "EASY" TO DEADLOCK WITH CUSTOM SORT FUNCS */
+
+	Py_LIST_LOCK_TEST(self, NULL);
 	if (self->ob_size <= 1) {
+		Py_LIST_UNLOCK(self);
 		INCREF(None);
 		return None;
 	}
-	save_comparefunc = comparefunc;
-	comparefunc = args;
-	if (comparefunc != NULL) {
+	save_comparefunc = pts->sort_comparefunc;
+	pts->sort_comparefunc = args;
+	if (pts->sort_comparefunc != NULL) {
 		/* Test the comparison function for obvious errors */
 		(void) cmp((ANY *)&self->ob_item[0], (ANY *)&self->ob_item[1]);
 		if (err_occurred()) {
-			comparefunc = save_comparefunc;
+			Py_LIST_UNLOCK(self);
+			pts->sort_comparefunc = save_comparefunc;
 			return NULL;
 		}
 	}
 	qsort((char *)self->ob_item,
 				(int) self->ob_size, sizeof(object *), cmp);
-	comparefunc = save_comparefunc;
+	Py_LIST_UNLOCK(self);
+	pts->sort_comparefunc = save_comparefunc;
 	if (err_occurred())
 		return NULL;
 	INCREF(None);
@@ -630,6 +820,7 @@ listreverse(self, args)
 		return NULL;
 	}
 
+	Py_LIST_LOCK_TEST(self, NULL);
 	if (self->ob_size > 1) {
 		for (p = self->ob_item, q = self->ob_item + self->ob_size - 1;
 						p < q; p++, q--) {
@@ -638,6 +829,7 @@ listreverse(self, args)
 			*q = tmp;
 		}
 	}
+	Py_LIST_UNLOCK(self);
 	
 	INCREF(None);
 	return None;
@@ -688,6 +880,14 @@ listtuple(v)
 	w = newtupleobject(n);
 	if (w == NULL)
 		return NULL;
+	if ( Py_LIST_LOCK(v) ) {
+		Py_DECREF(w);
+		return NULL;
+	}
+	if ( ((listobject *)v)->ob_size < n ) {
+		n = ((listobject *)v)->ob_size;
+		((tupleobject *)w)->ob_size = n;
+	}
 	p = ((tupleobject *)w)->ob_item;
 	memcpy((ANY *)p,
 	       (ANY *)((listobject *)v)->ob_item,
@@ -696,6 +896,7 @@ listtuple(v)
 		INCREF(*p);
 		p++;
 	}
+	Py_LIST_UNLOCK(v);
 	return w;
 }
 
@@ -710,10 +911,36 @@ listindex(self, args)
 		err_badarg();
 		return NULL;
 	}
+#ifndef WITH_FREE_THREAD
+
 	for (i = 0; i < self->ob_size; i++) {
 		if (cmpobject(self->ob_item[i], args) == 0)
 			return newintobject((long)i);
 	}
+
+#else
+
+	for (i = 0; ; i++) {
+		object *o;
+		int rc;
+		Py_LIST_LOCK_TEST(self, NULL);
+		if ( i >= self->ob_size ) {
+			Py_LIST_UNLOCK(self);
+			break;
+		}
+		o = self->ob_item[i];
+		Py_INCREF(o);
+		Py_LIST_LAZY_UNLOCK(self);
+		rc = cmpobject(o, args);
+		Py_DECREF(o);
+		if (rc == 0) {
+			Py_LIST_LAZY_DONE(self);
+			return newintobject((long)i);
+		}
+	}
+	Py_LIST_LAZY_DONE(self);
+#endif
+
 	err_setstr(ValueError, "list.index(x): x not in list");
 	return NULL;
 }
@@ -730,10 +957,35 @@ listcount(self, args)
 		err_badarg();
 		return NULL;
 	}
+
+#ifndef WITH_FREE_THREAD
+
 	for (i = 0; i < self->ob_size; i++) {
 		if (cmpobject(self->ob_item[i], args) == 0)
 			count++;
 	}
+
+#else
+
+	for (i = 0; ; i++) {
+		object *o;
+		int rc;
+		Py_LIST_LOCK_TEST(self, NULL);
+		if ( i >= self->ob_size ) {
+			Py_LIST_UNLOCK(self);
+			break;
+		}
+		o = self->ob_item[i];
+		Py_INCREF(o);
+		Py_LIST_LAZY_UNLOCK(self);
+		if ( cmpobject(o, args) == 0 )
+			count++;
+		Py_DECREF(o);
+	}
+	Py_LIST_LAZY_DONE(self);
+
+#endif
+
 	return newintobject((long)count);
 }
 
@@ -748,6 +1000,9 @@ listremove(self, args)
 		err_badarg();
 		return NULL;
 	}
+
+#ifndef WITH_FREE_THREAD
+
 	for (i = 0; i < self->ob_size; i++) {
 		if (cmpobject(self->ob_item[i], args) == 0) {
 			if (list_ass_slice(self, i, i+1, (object *)NULL) != 0)
@@ -755,8 +1010,34 @@ listremove(self, args)
 			INCREF(None);
 			return None;
 		}
-			
 	}
+
+#else
+
+	for (i = 0; ; i++) {
+		object *o;
+		int rc;
+		Py_LIST_LOCK_TEST(self, NULL);
+		if ( i >= self->ob_size ) {
+			Py_LIST_UNLOCK(self);
+			break;
+		}
+		o = self->ob_item[i];
+		Py_INCREF(o);
+		Py_LIST_LAZY_UNLOCK(self);
+		rc = cmpobject(o, args);
+		Py_DECREF(o);
+		if (rc == 0) {
+			Py_LIST_LAZY_DONE(self);
+			if (list_ass_slice(self, i, i+1, (object *)NULL) != 0)
+				return NULL;
+			INCREF(None);
+			return None;
+		}
+	}
+	Py_LIST_LAZY_DONE(self);
+#endif
+
 	err_setstr(ValueError, "list.remove(x): x not in list");
 	return NULL;
 }
